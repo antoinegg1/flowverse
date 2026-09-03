@@ -1,4 +1,4 @@
-"""Planning and lane prompts shared by both public parallel flows."""
+"""Planning and lane prompts shared by public parallel flows."""
 
 from __future__ import annotations
 
@@ -62,15 +62,22 @@ def lane_prompt(
     leaderboard_path: str = "shared/leaderboard.json",
     skill: str = "parallel-flame-chase",
     previous_lane_report: dict[str, object] | None = None,
+    mode_instructions: str = "",
+    ownership_instructions: str | None = None,
 ) -> str:
     """Build a self-contained fresh-session prompt for one alternating actor."""
-    ownership = (
-        "You are Lane 1, the sole integration owner. You may edit the original source. "
-        "Integrate other lanes only from validated artifact packages and keep the source coherent."
+    ownership = ownership_instructions or (
+        (
+            "You are Lane 1, the sole integration owner. You may edit the original source. "
+            "Integrate other lanes only from validated artifact packages and keep the source "
+            "coherent."
+        )
         if lane == "lane-1"
-        else "You are a private research lane. Work only in your snapshot. Do not edit the "
-        "original source. Publish every offered deliverable as explicit files under your artifact "
-        "root, with enough integration notes for Lane 1 to reconstruct it."
+        else (
+            "You are a private research lane. Work only in your snapshot. Do not edit the "
+            "original source. Publish every offered deliverable as explicit files under your "
+            "artifact root, with enough integration notes for Lane 1 to reconstruct it."
+        )
     )
     mission_text = _document(mission if mission is not None else initial_brief)
     integration_text = (
@@ -91,6 +98,11 @@ mission, inspect the durable files it cites, and rerun proportionate tests befor
 Continue correct work, repair stale or false claims, and record what you adopted or corrected in
 your own report.
 """
+    )
+    specialized_section = (
+        ""
+        if not mode_instructions
+        else f"\nMode-specific collaboration protocol:\n{mode_instructions}\n"
     )
     return f"""You are {actor_role}, taking turn {turn} for {lane} in a generic parallel Flame
 Chase. This is a fresh session. Read the repository, TASK.md when present, and the mounted
@@ -136,6 +148,7 @@ Workspace ownership:
 Reports from other lanes not yet acknowledged by this lane:
 {_document(unread_reports)}
 {same_lane_section}
+{specialized_section}
 
 Your artifact root is `{artifact_root}`. Artifact paths in a deliverable are relative to that
 root. You may update `{checkpoint_path}` during meaningful work using the LaneCheckpoint schema

@@ -48,6 +48,20 @@ class LaneScheduler(RuntimeState):
         """Return an optional same-lane handoff for additive report-share modes."""
         return None
 
+    def _unread_reports(
+        self, lane: LaneName, cursors: dict[str, Any]
+    ) -> tuple[list[dict[str, object]], dict[str, int]]:
+        """Return the ordinary inter-lane report batch for one consumer."""
+        return self.bus.unread(lane, cursors)
+
+    def _lane_instructions(self, lane: LaneName) -> str:
+        """Return additive mode instructions without changing LaneReport."""
+        return ""
+
+    def _lane_ownership(self, lane: LaneName) -> str | None:
+        """Override legacy Lane 1 integration ownership for additive modes."""
+        return None
+
     def _after_lane_scheduled(self, runtime: LaneRuntime) -> None:
         """Reset mode-specific ephemeral fields for a new turn."""
 
@@ -81,7 +95,7 @@ class LaneScheduler(RuntimeState):
             return
         self._validate_layout()
         cursors = cast("dict[str, Any]", self.control["bus_cursors"])
-        unread, acknowledgements = self.bus.unread(lane, cursors)
+        unread, acknowledgements = self._unread_reports(lane, cursors)
         identity = self._identity(lane)
         turn = int(durable.get("turns", 0)) + 1
         actor_index = int(durable.get("next_actor", runtime.actor_at)) % 2
@@ -108,6 +122,8 @@ class LaneScheduler(RuntimeState):
             },
             skill=self.skill_name,
             previous_lane_report=self._previous_lane_report(lane),
+            mode_instructions=self._lane_instructions(lane),
+            ownership_instructions=self._lane_ownership(lane),
         )
         runtime.identity = identity
         runtime.pending_ack = acknowledgements

@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from _parallel_flame_chase.core.api import OrchestrateorAgents
+from _parallel_flame_chase.core.api import GitPRAgents, OrchestrateorAgents
 from _parallel_flame_chase.core.models import (
     InitialPlan,
     LaneBrief,
@@ -171,6 +171,22 @@ def test_additive_flows_keep_original_entries_and_use_orchestrateor() -> None:
         drives(flows / "parallel_flame_chase_mission" / "__init__.py")[0]
         == "coordinator"
     )
+
+    git_pr = flows / "parallel_flame_chase_git_pr" / "__init__.py"
+    assert drives(git_pr) == GitPRAgents._fields
+    assert resumes(git_pr)
+    git_config = configures(git_pr)
+    assert git_config is not None
+    assert set(git_config.model_fields) == {
+        "rest_seconds",
+        "resume_mode",
+        "git_pr_enabled",
+        "global_knowledge_enabled",
+    }
+    assert [skill.name for skill in brought(git_pr.parent)] == [
+        "parallel-flame-chase-git-pr"
+    ]
+    assert "parallel_flame_chase_git_pr" in names
 
 
 def test_mission_lite_only_escalates_terminal_audit_for_shared_best() -> None:

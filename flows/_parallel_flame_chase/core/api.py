@@ -1,4 +1,4 @@
-"""Shared public types for the two independently registered flows."""
+"""Shared public types for independently registered parallel flows."""
 
 from __future__ import annotations
 
@@ -39,8 +39,26 @@ class OrchestrateorAgents(NamedTuple):
         return self.orchestrateor
 
 
+class GitPRAgents(NamedTuple):
+    """Git/PR topology with a distinct knowledge-review role."""
+
+    orchestrateor: NoGoals
+    knowledge_reviewer: NoGoals
+    lane_1_actor_a: NoGoals
+    lane_1_actor_b: NoGoals
+    lane_2_actor_a: NoGoals
+    lane_2_actor_b: NoGoals
+    lane_3_actor_a: NoGoals
+    lane_3_actor_b: NoGoals
+
+    @property
+    def coordinator(self) -> NoGoals:
+        """Adapt the historical spelling to the shared scheduler interface."""
+        return self.orchestrateor
+
+
 class BaseConfig(BaseModel):
-    """Pacing and resume policy shared by both schedulers."""
+    """Pacing and resume policy shared by the parallel schedulers."""
 
     model_config = {"extra": "forbid"}
 

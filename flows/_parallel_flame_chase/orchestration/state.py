@@ -59,6 +59,7 @@ class RuntimeState:
     )
     orchestrator_role_name = "coordinator"
     replan_on_objective_revision = True
+    executor_workers = 4
 
     def __init__(
         self,
@@ -84,7 +85,7 @@ class RuntimeState:
         self.bus: ReportBus
         self.lanes: dict[LaneName, LaneRuntime] = {}
         self.executor = ThreadPoolExecutor(
-            max_workers=4,
+            max_workers=self.executor_workers,
             thread_name_prefix="parallel-flame",
         )
         self.completed_turns = 0
