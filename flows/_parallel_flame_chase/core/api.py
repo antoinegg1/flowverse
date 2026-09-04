@@ -40,10 +40,9 @@ class OrchestrateorAgents(NamedTuple):
 
 
 class GitPRAgents(NamedTuple):
-    """Git/PR topology with a distinct knowledge-review role."""
+    """Git/PR topology with one planner and two alternating actors per lane."""
 
     orchestrateor: NoGoals
-    knowledge_reviewer: NoGoals
     lane_1_actor_a: NoGoals
     lane_1_actor_b: NoGoals
     lane_2_actor_a: NoGoals

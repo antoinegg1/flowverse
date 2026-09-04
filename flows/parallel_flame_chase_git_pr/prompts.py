@@ -1,4 +1,4 @@
-"""Self-contained lane, PR-review, and knowledge-review instructions."""
+"""Self-contained lane and legacy orchestrateor PR-review instructions."""
 
 from __future__ import annotations
 
@@ -176,47 +176,8 @@ remains and neither transition was completed.
 """
 
 
-def knowledge_review_prompt(
-    *,
-    objective: str,
-    reports: list[dict[str, object]],
-    visible_knowledge: dict[str, object],
-    pending_experiences: list[dict[str, object]],
-) -> str:
-    """Ask an independent reviewer to accumulate only durable cognition."""
-    report_ids = [item["report_id"] for item in reports]
-    return f"""You are the independent knowledge reviewer for a long-horizon MLE run. Do not edit
-the repository. Review the exact immutable batch below and return only KnowledgeReview.
-
-Objective:
-{objective}
-
-Exact report IDs (return this same list, in this order):
-{document(report_ids)}
-
-New reports:
-{document(reports)}
-
-Currently visible verified facts and accepted success experiences:
-{document(visible_knowledge)}
-
-Success skeletons awaiting enrichment:
-{document(pending_experiences)}
-
-The fact graph is for atomic, important conclusions that prevent repeated exploration—not a diary.
-Add a fact only with an explicit proof, evidence references, dependency IDs, and narrow scope. A
-claim from an unmerged branch is allowed only when its scope makes that limitation unmistakable.
-Name known contradictions so both claims are quarantined. Mark facts stale when their scope/evidence
-no longer applies; revoke facts only when invalidity is established (dependents are revoked by the
-runtime). Do not turn failures, dead ends, ordinary progress events, guesses, or coordinator
-decisions into facts. Success ExperienceCards are separate: enrich only listed accepted skeletons
-with method, why it worked, and limitations. It is valid to produce no facts or updates.
-"""
-
-
 __all__ = [
     "git_planning_prompt",
-    "knowledge_review_prompt",
     "lane_protocol",
     "pr_review_prompt",
 ]

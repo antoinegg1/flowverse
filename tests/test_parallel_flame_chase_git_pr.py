@@ -372,7 +372,19 @@ class FakeAgent:
 
 
 def agents() -> GitPRAgents:
-    return GitPRAgents(*(FakeAgent() for _ in range(8)))  # type: ignore[arg-type]
+    return GitPRAgents(*(FakeAgent() for _ in range(7)))  # type: ignore[arg-type]
+
+
+def test_git_pr_agent_topology_has_no_reviewer_slot() -> None:
+    assert GitPRAgents._fields == (
+        "orchestrateor",
+        "lane_1_actor_a",
+        "lane_1_actor_b",
+        "lane_2_actor_a",
+        "lane_2_actor_b",
+        "lane_3_actor_a",
+        "lane_3_actor_b",
+    )
 
 
 @pytest.mark.parametrize(

@@ -725,10 +725,10 @@ class CoordinationStore:
         return updated
 
     def enqueue_report(self, report: dict[str, object]) -> None:
-        """Queue every immutable lane report for independent semantic review."""
+        """Retain a legacy immutable report-queue record for state compatibility."""
         report_id = report.get("report_id")
         if not isinstance(report_id, str):
-            raise TypeError("knowledge review requires a report_id")
+            raise TypeError("the report queue requires a report_id")
         with self.connect() as connection:
             connection.execute(
                 """
@@ -740,7 +740,7 @@ class CoordinationStore:
             )
 
     def pending_reports(self, limit: int = 6) -> list[dict[str, object]]:
-        """Return the next immutable reviewer batch without claiming it."""
+        """Return pending records from the legacy report queue."""
         with self.connect(readonly=True) as connection:
             rows = connection.execute(
                 """
@@ -755,7 +755,7 @@ class CoordinationStore:
         ]
 
     def mark_reports_reviewed(self, report_ids: Sequence[str]) -> None:
-        """Acknowledge only the exact batch a valid reviewer result names."""
+        """Acknowledge an exact batch from the legacy report queue."""
         if not report_ids:
             return
         with self.connect() as connection:
@@ -768,7 +768,7 @@ class CoordinationStore:
             )
 
     def add_fact(self, proposal: dict[str, object]) -> dict[str, object]:
-        """Insert one reviewer-verified atomic fact and dependency edges."""
+        """Insert one evidence-backed atomic fact and dependency edges."""
         identity = {
             key: proposal.get(key)
             for key in ("statement", "proof", "scope", "evidence", "dependencies")

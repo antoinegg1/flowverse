@@ -1,4 +1,4 @@
-"""Factorial Report Share runtime with local Git/PR and reviewed knowledge."""
+"""Factorial Report Share runtime with local Git/PR and compact knowledge."""
 
 from __future__ import annotations
 
@@ -32,10 +32,9 @@ if TYPE_CHECKING:
     from _parallel_flame_chase.lanes.runtime import LaneRuntime
     from hmz.flows import Session
 
-from .models import KnowledgeReview, PRReviewResult
+from .models import PRReviewResult
 from .prompts import (
     git_planning_prompt,
-    knowledge_review_prompt,
     lane_protocol,
     pr_review_prompt,
 )
@@ -75,16 +74,6 @@ class PRReviewWork:
     workspace: Path | None = None
 
 
-@dataclass(slots=True)
-class KnowledgeReviewWork:
-    """Ephemeral handles for one immutable semantic-review batch."""
-
-    future: Future[KnowledgeReview | None] | None = None
-    session: Session | None = None
-    report_ids: tuple[str, ...] = ()
-    experience_ids: tuple[str, ...] = ()
-
-
 def run_pr_review(session: Session, prompt: str) -> PRReviewResult | None:
     """Repair only result shape after the coordinator has acted."""
     current = prompt
@@ -106,31 +95,6 @@ transition you already completed. If no transition completed, use `continue`.
             return result
         current = """Do not perform more actions. Return only PRReviewResult for the review work
 you just completed; use `continue` if neither merge nor explicit rejection completed."""
-    return None
-
-
-def run_knowledge_review(session: Session, prompt: str) -> KnowledgeReview | None:
-    """Repair only structured review shape, never semantic source material."""
-    current = prompt
-    for attempt in range(3):
-        try:
-            result = session(current, suppress=False, schema=KnowledgeReview)
-        except Stopped:
-            raise
-        except ValueError as why:
-            if attempt == FINAL_REPAIR_ATTEMPT:
-                raise
-            current = f"""Your knowledge review failed schema validation: {why}
-
-Do not inspect new material. Return only a corrected KnowledgeReview for the exact batch you just
-reviewed, retaining its report IDs and evidence.
-"""
-            continue
-        if result is not None:
-            return result
-        current = (
-            "Return only KnowledgeReview for the exact batch you already reviewed."
-        )
     return None
 
 
@@ -166,7 +130,6 @@ class GitPRRuntime(ReportShareRuntime):
         self.git_paths: GitRunPaths
         self.store: CoordinationStore
         self.pr_review = PRReviewWork()
-        self.knowledge_review = KnowledgeReviewWork()
 
     @property
     def git_pr_enabled(self) -> bool:
@@ -209,7 +172,7 @@ class GitPRRuntime(ReportShareRuntime):
                 "receipt_cursor": 0,
                 "review_attempts": {},
             },
-            "knowledge": {"reviews": 0, "last_summary": None},
+            "knowledge": {"digest_updates": 0, "last_summary": None},
         }
 
     def _validate_mode_control(self) -> None:
@@ -234,9 +197,19 @@ class GitPRRuntime(ReportShareRuntime):
         cursor = git_state.get("receipt_cursor")
         if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
             raise ValueError("resumable receipt cursor must be non-negative")
-        reviews = knowledge_state.get("reviews")
-        if not isinstance(reviews, int) or isinstance(reviews, bool) or reviews < 0:
-            raise ValueError("resumable knowledge review count must be non-negative")
+        digest_updates = knowledge_state.get(
+            "digest_updates", knowledge_state.get("reviews", 0)
+        )
+        if (
+            not isinstance(digest_updates, int)
+            or isinstance(digest_updates, bool)
+            or digest_updates < 0
+        ):
+            raise ValueError(
+                "resumable knowledge digest update count must be non-negative"
+            )
+        knowledge_state["digest_updates"] = digest_updates
+        knowledge_state.pop("reviews", None)
 
     def _source_files(self) -> tuple[Path, Path, Path]:
         directory = Path(__file__).resolve().parent
@@ -571,7 +544,9 @@ class GitPRRuntime(ReportShareRuntime):
             )
             self.store.compact_experiences(limit=KNOWLEDGE_DIGEST_LIMIT)
             knowledge_state = cast("dict[str, Any]", self.control["knowledge"])
-            knowledge_state["reviews"] = int(knowledge_state.get("reviews", 0)) + 1
+            knowledge_state["digest_updates"] = (
+                int(knowledge_state.get("digest_updates", 0)) + 1
+            )
             knowledge_state["last_summary"] = report.summary[:300]
             self._emit_system(
                 targets=self.lane_names,
@@ -1169,134 +1144,6 @@ class GitPRRuntime(ReportShareRuntime):
         git_state["receipt_cursor"] = end
         return end != cursor
 
-    def _start_knowledge_review(self) -> bool:
-        if (
-            not self.global_knowledge_enabled
-            or self.knowledge_review.future is not None
-        ):
-            return False
-        reports = self.store.pending_reports(limit=6)
-        experiences = self.store.pending_experiences(limit=12)
-        if not reports and not experiences:
-            return False
-        prompt = knowledge_review_prompt(
-            objective=cast("str", self.control["objective"]),
-            reports=reports,
-            visible_knowledge=self.store.knowledge_index(),
-            pending_experiences=experiences,
-        )
-        session = self.agents.knowledge_reviewer.new(cwd=self.paths.planning)
-        self.knowledge_review = KnowledgeReviewWork(
-            future=self.executor.submit(run_knowledge_review, session, prompt),
-            session=session,
-            report_ids=tuple(cast("str", item["report_id"]) for item in reports),
-            experience_ids=tuple(cast("str", item["id"]) for item in experiences),
-        )
-        self.store.record_telemetry(
-            "knowledge_review_started",
-            {
-                "report_ids": list(self.knowledge_review.report_ids),
-                "experience_ids": list(self.knowledge_review.experience_ids),
-            },
-        )
-        return True
-
-    def _collect_knowledge_review(self) -> bool:
-        future = self.knowledge_review.future
-        if future is None or not future.done():
-            return False
-        expected_reports = self.knowledge_review.report_ids
-        expected_experiences = set(self.knowledge_review.experience_ids)
-        result: KnowledgeReview | None = None
-        error: str | None = None
-        try:
-            result = future.result()
-        except Stopped:
-            raise
-        except Exception as why:  # noqa: BLE001 - preserve reviewer diagnostics
-            error = f"{type(why).__name__}: {why}"[:2000]
-        close_safely(self.knowledge_review.session)
-        self.knowledge_review = KnowledgeReviewWork()
-        if result is None or tuple(result.report_ids) != expected_reports:
-            self.store.record_telemetry(
-                "knowledge_review_invalid",
-                {"report_ids": list(expected_reports), "error": error or "ID mismatch"},
-            )
-            return True
-        update_ids = [item.experience_id for item in result.experience_updates]
-        if len(update_ids) != len(set(update_ids)) or not set(update_ids).issubset(
-            expected_experiences
-        ):
-            self.store.record_telemetry(
-                "knowledge_review_invalid",
-                {
-                    "report_ids": list(expected_reports),
-                    "error": "experience updates exceed the offered skeletons",
-                },
-            )
-            return True
-        if set(result.stale_fact_ids) & set(result.revoke_fact_ids):
-            self.store.record_telemetry(
-                "knowledge_review_invalid",
-                {
-                    "report_ids": list(expected_reports),
-                    "error": "a fact cannot be stale and revoked in one review",
-                },
-            )
-            return True
-        try:
-            stale: set[str] = set()
-            revoked: set[str] = set()
-            facts = [
-                self.store.add_fact(proposal.model_dump(mode="json"))
-                for proposal in result.facts
-            ]
-            for fact_id in result.stale_fact_ids:
-                stale.update(self.store.mark_fact_stale(fact_id))
-            for fact_id in result.revoke_fact_ids:
-                revoked.update(self.store.revoke_fact(fact_id))
-            for update in result.experience_updates:
-                self.store.enrich_experience(
-                    update.experience_id,
-                    method=update.method,
-                    why_it_worked=update.why_it_worked,
-                    limitations=update.limitations,
-                )
-        except (KeyError, ValueError) as why:
-            self.store.record_telemetry(
-                "knowledge_review_invalid",
-                {"report_ids": list(expected_reports), "error": str(why)[:2000]},
-            )
-            return True
-        self.store.mark_reports_reviewed(result.report_ids)
-        knowledge_state = cast("dict[str, Any]", self.control["knowledge"])
-        knowledge_state["reviews"] = int(knowledge_state.get("reviews", 0)) + 1
-        knowledge_state["last_summary"] = result.summary
-        changed_ids = [cast("str", fact["id"]) for fact in facts]
-        if changed_ids or update_ids or stale or revoked:
-            self._emit_system(
-                targets=self.lane_names,
-                kind="knowledge_updated",
-                summary=result.summary,
-                payload={
-                    "verified_or_conflicted_fact_ids": changed_ids,
-                    "enriched_experience_ids": update_ids,
-                    "stale_fact_ids": sorted(stale),
-                    "revoked_fact_ids": sorted(revoked),
-                },
-            )
-        self.store.record_telemetry(
-            "knowledge_review_completed",
-            {
-                "report_ids": list(expected_reports),
-                "fact_ids": changed_ids,
-                "experience_ids": update_ids,
-                "summary": result.summary,
-            },
-        )
-        self._refresh_views()
-        return True
-
     def _knowledge_markdown(self, index: dict[str, object]) -> str:
         lines = ["# Run-local global knowledge", ""]
         lines.extend(("## Verified facts", ""))
@@ -1391,7 +1238,6 @@ class GitPRRuntime(ReportShareRuntime):
     def _close_sessions(self) -> None:
         super()._close_sessions()
         close_safely(self.pr_review.session)
-        close_safely(self.knowledge_review.session)
 
 
 def execute(
