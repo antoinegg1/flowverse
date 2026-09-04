@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _parallel_flame_chase.core.api import GitPRAgents
+from _parallel_flame_chase.core.api import BaseConfig, GitPRAgents
 from _parallel_flame_chase.core.models import (
     InitialPlan,
     LaneBrief,
@@ -26,6 +26,16 @@ from parallel_flame_chase_git_pr.repository import (
 )
 from parallel_flame_chase_git_pr.runtime import GitPRRuntime, execute
 from parallel_flame_chase_git_pr.storage import CoordinationStore
+
+
+class RuntimeConfig(BaseConfig):
+    """Exercise the shared runtime's independently switchable internal mechanisms."""
+
+    git_pr_enabled: bool = True
+    global_knowledge_enabled: bool = False
+    experiment_memory_enabled: bool = False
+    token_efficient_enabled: bool = False
+    main_update_monitor_enabled: bool = False
 
 
 def command(
@@ -387,6 +397,25 @@ def test_git_pr_agent_topology_has_no_reviewer_slot() -> None:
     )
 
 
+def test_canonical_git_pr_lite_configuration_is_git_only() -> None:
+    config = Config()
+    assert config.git_pr_enabled is True
+    assert config.global_knowledge_enabled is False
+    assert config.experiment_memory_enabled is False
+    assert config.token_efficient_enabled is False
+    assert config.main_update_monitor_enabled is False
+    forbidden_overrides = {
+        "git_pr_enabled": False,
+        "global_knowledge_enabled": True,
+        "experiment_memory_enabled": True,
+        "token_efficient_enabled": True,
+        "main_update_monitor_enabled": True,
+    }
+    for field, value in forbidden_overrides.items():
+        with pytest.raises(ValueError):
+            Config.model_validate({field: value})
+
+
 @pytest.mark.parametrize(
     ("git_enabled", "knowledge_enabled"),
     [(False, False), (True, False), (False, True), (True, True)],
@@ -406,7 +435,7 @@ def test_every_factorial_cell_freezes_its_run_settings(
     runtime = GitPRRuntime(
         agents(),
         "Improve candidate.py.",
-        Config(
+        RuntimeConfig(
             rest_seconds=0.05,
             git_pr_enabled=git_enabled,
             global_knowledge_enabled=knowledge_enabled,
@@ -436,7 +465,7 @@ def test_git_runtime_gives_every_lane_an_isolated_clone(
     execute(
         chosen,
         "Improve candidate.py.",
-        Config(
+        RuntimeConfig(
             rest_seconds=0.05,
             git_pr_enabled=True,
             global_knowledge_enabled=False,
@@ -469,7 +498,7 @@ def test_git_runtime_gives_every_lane_an_isolated_clone(
     execute(
         resumed,
         "Improve candidate.py.",
-        Config(
+        RuntimeConfig(
             rest_seconds=0.05,
             git_pr_enabled=False,
             global_knowledge_enabled=True,
@@ -498,7 +527,7 @@ def test_experiment_memory_runtime_is_independent_of_git(
     execute(
         chosen,
         "Improve candidate.py.",
-        Config(
+        RuntimeConfig(
             rest_seconds=0.05,
             git_pr_enabled=False,
             global_knowledge_enabled=False,
@@ -532,7 +561,7 @@ def test_token_efficient_prompt_removes_redundant_model_checks(
     execute(
         chosen,
         "Improve candidate.py.",
-        Config(
+        RuntimeConfig(
             rest_seconds=0.05,
             git_pr_enabled=True,
             global_knowledge_enabled=False,
@@ -558,7 +587,7 @@ def test_main_update_monitor_interjects_active_lane_sessions(
     runtime = GitPRRuntime(
         agents(),
         "Improve candidate.py.",
-        Config(
+        RuntimeConfig(
             rest_seconds=0.05,
             git_pr_enabled=True,
             global_knowledge_enabled=False,

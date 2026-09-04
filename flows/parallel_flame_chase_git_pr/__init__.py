@@ -1,12 +1,11 @@
-"""Parallel Flame Chase with factorial Git/PR and global-knowledge controls."""
+"""The fixed Git-PR-only Parallel Flame Chase Lite workflow."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from _parallel_flame_chase.core.api import BaseConfig, GitPRAgents
 from hmz.flows import flow
-from pydantic import Field
 
 from parallel_flame_chase_git_pr.runtime import execute
 
@@ -14,28 +13,13 @@ Agents = GitPRAgents
 
 
 class Config(BaseConfig):
-    """Freeze the independently switchable collaboration mechanisms for one run."""
+    """Freeze the previously measured best Git PR Lite mechanism set."""
 
-    git_pr_enabled: bool = Field(
-        default=True,
-        description="Use isolated clones and score-prioritized receipt-fast-path PRs.",
-    )
-    global_knowledge_enabled: bool = Field(
-        default=True,
-        description="Retain a compact run-local digest of evaluator-backed successes.",
-    )
-    experiment_memory_enabled: bool = Field(
-        default=False,
-        description="Use a deterministic intent-indexed run-local experiment ledger.",
-    )
-    token_efficient_enabled: bool = Field(
-        default=False,
-        description="Remove repeated model-side checks already enforced by the runtime.",
-    )
-    main_update_monitor_enabled: bool = Field(
-        default=False,
-        description="Steer compact main-update notices into active lane turns.",
-    )
+    git_pr_enabled: Literal[True] = True
+    global_knowledge_enabled: Literal[False] = False
+    experiment_memory_enabled: Literal[False] = False
+    token_efficient_enabled: Literal[False] = False
+    main_update_monitor_enabled: Literal[False] = False
 
 
 @flow(resumable=True)
@@ -45,7 +29,7 @@ def run(
     config: Config | None = None,
     state: dict[str, Any] | None = None,
 ) -> None:
-    """Run one frozen factorial cell with Report Share retained in every cell."""
+    """Run fixed Git PR Lite with Report Share and deterministic integration."""
     execute(agents, task, config or Config(), state)
 
 

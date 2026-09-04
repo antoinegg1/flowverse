@@ -1,22 +1,20 @@
 # Parallel Flame Chase Git/PR
 
-`parallel_flame_chase_git_pr` retains Report Share and provides independently switchable
-mechanisms: a receipt-fast-path PR protocol, a compact run-local knowledge digest, and Experiment
-Memory Lite. The flags are frozen when a run is created.
+`parallel_flame_chase_git_pr` is the fixed Git-PR-only configuration that performed best in the
+12-hour Git PR Lite experiment. It retains Report Share and deterministic receipt-fast-path PR
+integration while disabling the mechanisms that were not part of that result:
 
-| `git_pr_enabled` | `global_knowledge_enabled` | Behavior |
-| --- | --- | --- |
-| false | false | Existing Report Share behavior |
-| true | false | Isolated Git branches and score-prioritized receipt integration |
-| false | true | Existing workspaces plus a compact shared-best digest |
-| true | true | Receipt integration plus the compact digest |
+| Setting | Fixed value |
+| --- | --- |
+| `git_pr_enabled` | `true` |
+| `global_knowledge_enabled` | `false` |
+| `experiment_memory_enabled` | `false` |
+| `token_efficient_enabled` | `false` |
+| `main_update_monitor_enabled` | `false` |
 
-`experiment_memory_enabled` enables a deterministic, intent-indexed experiment ledger rather
-than a success digest. It can run with Git/PR disabled, where evaluator evidence is bound to
-content-hashed task files, or with Git/PR enabled, where the same receipt can support an experiment
-record and a PR. Records remain local to one run and seed. Agents query at most three records for
-a declared intent; an already covered scope is a warning that can be reopened with an explicit
-changed-base, new-range, new-interaction, or evidence-gap reason.
+These values are literals rather than optional defaults, so a launch cannot accidentally turn the
+canonical workflow into a different treatment. Token-efficient and main-monitor treatments remain
+available under their separately named workflow directories.
 
 The seven ordered agents are `orchestrateor`, followed by A/B partners for lanes 1, 2, and 3. The
 orchestrateor plans once; each lane runs one actor at a time and alternates its A/B partners across
@@ -38,11 +36,8 @@ commit/tree before and after the command, stores stdout/stderr outside Git, and 
 immutable receipt. Code and light files belong in Git; large artifacts can use `pfc artifact put`.
 
 SQLite/WAL is live truth, JSONL is the audit stream, and JSON/Markdown are disposable views.
-Evaluator-backed shared-best and merged results create compact ExperienceCards automatically.
-Only the newest 12 stay in the hot digest and at most four are injected into a lane prompt. There
-is no separate knowledge model or reviewer agent; failures and routine progress remain in Report
-Share's archive. System reports broadcast merges and digest updates while routing rejection and
-invalid receipts only to the affected lane.
+Global Knowledge and Experiment Memory are disabled: cross-lane information comes from Report
+Share plus deterministic merge/rejection system reports, and no reviewer agent is used.
 
 ```console
 hmz exec -f ./flows/parallel_flame_chase_git_pr \
@@ -55,5 +50,5 @@ hmz exec -f ./flows/parallel_flame_chase_git_pr \
 ```
 
 Runs are resumable. Runtime state retains the central refs, receipts, artifacts, report archives,
-ledger, and compact knowledge index. The
-original source is assumed not to change outside the flow while it holds the source lock.
+and official ledger. The original source is assumed not to change outside the flow while it holds
+the source lock.
