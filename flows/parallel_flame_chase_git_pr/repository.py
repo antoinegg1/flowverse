@@ -236,6 +236,7 @@ def initialize_shadow_repository(
     cli_source: Path,
     storage_source: Path,
     hook_source: Path,
+    lanes: tuple[str, ...] = ("lane-1", "lane-2", "lane-3"),
 ) -> str:
     """Freeze source into main and create isolated lane/integration clones."""
     _copy_source(source, paths.planning)
@@ -253,7 +254,7 @@ def initialize_shadow_repository(
     git("remote", "add", "origin", str(paths.central), cwd=paths.planning)
     git("push", "origin", "main", cwd=paths.planning)
 
-    for lane in ("lane-1", "lane-2", "lane-3"):
+    for lane in lanes:
         git("clone", "--no-hardlinks", str(paths.central), str(paths.lane(lane)))
         configure_clone(paths.lane(lane), lane=lane, run_root=paths.root)
     git("clone", "--no-hardlinks", str(paths.central), str(paths.integration))
@@ -269,12 +270,15 @@ def initialize_shadow_repository(
     paths.system_reports.mkdir(parents=True, exist_ok=True)
     paths.evaluation_artifacts.mkdir(parents=True, exist_ok=True)
     paths.object_store.mkdir(parents=True, exist_ok=True)
-    for lane in ("lane-1", "lane-2", "lane-3"):
+    for lane in lanes:
         (paths.system_reports / f"{lane}.jsonl").touch()
     return main_sha(paths.central)
 
 
-def validate_shadow_repository(paths: GitRunPaths) -> None:
+def validate_shadow_repository(
+    paths: GitRunPaths,
+    lanes: tuple[str, ...] = ("lane-1", "lane-2", "lane-3"),
+) -> None:
     """Reject partial or replaced Git state on resume."""
     directories = (
         paths.central,
@@ -283,7 +287,7 @@ def validate_shadow_repository(paths: GitRunPaths) -> None:
         paths.system_reports,
         paths.evaluation_artifacts,
         paths.object_store,
-        *(paths.lane(lane) for lane in ("lane-1", "lane-2", "lane-3")),
+        *(paths.lane(lane) for lane in lanes),
     )
     files = (
         paths.bin / "pfc",
@@ -291,10 +295,7 @@ def validate_shadow_repository(paths: GitRunPaths) -> None:
         paths.database,
         paths.events,
         paths.central / "hooks" / "pre-receive",
-        *(
-            paths.system_reports / f"{lane}.jsonl"
-            for lane in ("lane-1", "lane-2", "lane-3")
-        ),
+        *(paths.system_reports / f"{lane}.jsonl" for lane in lanes),
     )
     for path in directories:
         try:

@@ -1,8 +1,8 @@
 # Parallel Flame Chase Git/PR
 
-`parallel_flame_chase_git_pr` retains Report Share and adds two independently switchable
-mechanisms: a receipt-fast-path PR protocol and a compact run-local knowledge digest. The flags are
-frozen when a run is created, giving a complete 2x2 experiment:
+`parallel_flame_chase_git_pr` retains Report Share and provides independently switchable
+mechanisms: a receipt-fast-path PR protocol, a compact run-local knowledge digest, and Experiment
+Memory Lite. The flags are frozen when a run is created.
 
 | `git_pr_enabled` | `global_knowledge_enabled` | Behavior |
 | --- | --- | --- |
@@ -10,6 +10,13 @@ frozen when a run is created, giving a complete 2x2 experiment:
 | true | false | Isolated Git branches and score-prioritized receipt integration |
 | false | true | Existing workspaces plus a compact shared-best digest |
 | true | true | Receipt integration plus the compact digest |
+
+`experiment_memory_enabled` enables a deterministic, intent-indexed experiment ledger rather
+than a success digest. It can run with Git/PR disabled, where evaluator evidence is bound to
+content-hashed task files, or with Git/PR enabled, where the same receipt can support an experiment
+record and a PR. Records remain local to one run and seed. Agents query at most three records for
+a declared intent; an already covered scope is a warning that can be reopened with an explicit
+changed-base, new-range, new-interaction, or evidence-gap reason.
 
 The eight ordered agents are `orchestrateor`, `knowledge_reviewer`, and A/B partners for lanes 1,
 2, and 3. With Git enabled, every lane owns one clone and has equal PR rights. The runtime owns a

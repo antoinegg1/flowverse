@@ -186,7 +186,7 @@ def main() -> None:
         old, new, reference = line.strip().split()
         if reference == "refs/heads/main":
             protect_main(repository, database, old, new)
-        elif re.fullmatch(r"refs/heads/lane-[123]/[^\s]+", reference):
+        elif re.fullmatch(r"refs/heads/lane-[1-4]/[^\s]+", reference):
             protect_lane(database, reference, new)
         else:
             reject(f"unsupported pushed reference: {reference}")

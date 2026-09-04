@@ -14,7 +14,7 @@ Agents = GitPRAgents
 
 
 class Config(BaseConfig):
-    """Freeze the two factorial collaboration mechanisms for one run."""
+    """Freeze the independently switchable collaboration mechanisms for one run."""
 
     git_pr_enabled: bool = Field(
         default=True,
@@ -23,6 +23,18 @@ class Config(BaseConfig):
     global_knowledge_enabled: bool = Field(
         default=True,
         description="Retain a compact run-local digest of evaluator-backed successes.",
+    )
+    experiment_memory_enabled: bool = Field(
+        default=False,
+        description="Use a deterministic intent-indexed run-local experiment ledger.",
+    )
+    token_efficient_enabled: bool = Field(
+        default=False,
+        description="Remove repeated model-side checks already enforced by the runtime.",
+    )
+    main_update_monitor_enabled: bool = Field(
+        default=False,
+        description="Steer compact main-update notices into active lane turns.",
     )
 
 

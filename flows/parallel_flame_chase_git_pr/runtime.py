@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from _parallel_flame_chase.core.models import LANES, InitialPlan, LaneName, LaneReport
+from _parallel_flame_chase.core.models import InitialPlan, LaneName, LaneReport
 from _parallel_flame_chase.core.utils import (
     atomic_json,
     atomic_text,
@@ -176,11 +176,32 @@ class GitPRRuntime(ReportShareRuntime):
     def global_knowledge_enabled(self) -> bool:
         return bool(self.control.get("global_knowledge_enabled", False))
 
+    @property
+    def experiment_memory_enabled(self) -> bool:
+        return bool(self.control.get("experiment_memory_enabled", False))
+
+    @property
+    def token_efficient_enabled(self) -> bool:
+        return bool(self.control.get("token_efficient_enabled", False))
+
+    @property
+    def main_update_monitor_enabled(self) -> bool:
+        return bool(self.control.get("main_update_monitor_enabled", False))
+
     def _new_mode_control(self) -> dict[str, object]:
         return {
             "git_pr_enabled": bool(getattr(self.config, "git_pr_enabled", True)),
             "global_knowledge_enabled": bool(
                 getattr(self.config, "global_knowledge_enabled", True)
+            ),
+            "experiment_memory_enabled": bool(
+                getattr(self.config, "experiment_memory_enabled", False)
+            ),
+            "token_efficient_enabled": bool(
+                getattr(self.config, "token_efficient_enabled", False)
+            ),
+            "main_update_monitor_enabled": bool(
+                getattr(self.config, "main_update_monitor_enabled", False)
             ),
             "git_pr": {
                 "observed_main_sha": None,
@@ -192,7 +213,13 @@ class GitPRRuntime(ReportShareRuntime):
         }
 
     def _validate_mode_control(self) -> None:
-        for field in ("git_pr_enabled", "global_knowledge_enabled"):
+        for field in (
+            "git_pr_enabled",
+            "global_knowledge_enabled",
+            "experiment_memory_enabled",
+            "token_efficient_enabled",
+            "main_update_monitor_enabled",
+        ):
             if not isinstance(self.control.get(field), bool):
                 raise TypeError(f"resumable {field} must be boolean")
         git_state = self.control.get("git_pr")
@@ -226,7 +253,7 @@ class GitPRRuntime(ReportShareRuntime):
         self.control = self._new_control(objective)
         self.paths = RunPaths(Path(cast("str", self.control["run_root"])), self.source)
         self.paths.root.mkdir(parents=True, exist_ok=False)
-        initialize_paths(self.paths, make_snapshots=False)
+        initialize_paths(self.paths, make_snapshots=False, lanes=self.lane_names)
         self.git_paths = GitRunPaths(self.paths.root)
         cli_source, storage_source, hook_source = self._source_files()
         baseline = initialize_shadow_repository(
@@ -235,6 +262,7 @@ class GitPRRuntime(ReportShareRuntime):
             cli_source=cli_source,
             storage_source=storage_source,
             hook_source=hook_source,
+            lanes=cast("tuple[str, ...]", self.lane_names),
         )
         self.store = CoordinationStore(self.git_paths.database, self.git_paths.events)
         allowed_paths = discover_allowed_paths(self.source, objective)
@@ -242,6 +270,8 @@ class GitPRRuntime(ReportShareRuntime):
             run_id=cast("str", self.control["run_id"]),
             git_pr_enabled=True,
             global_knowledge_enabled=self.global_knowledge_enabled,
+            experiment_memory_enabled=self.experiment_memory_enabled,
+            lanes=cast("tuple[str, ...]", self.lane_names),
             allowed_paths=allowed_paths,
             trusted_evaluator_command=discover_evaluator_command(
                 self.source, objective
@@ -264,7 +294,7 @@ class GitPRRuntime(ReportShareRuntime):
             self.git_paths.system_reports.mkdir(parents=True, exist_ok=True)
             self.git_paths.evaluation_artifacts.mkdir(parents=True, exist_ok=True)
             self.git_paths.object_store.mkdir(parents=True, exist_ok=True)
-            for lane in LANES:
+            for lane in self.lane_names:
                 (self.git_paths.system_reports / f"{lane}.jsonl").touch(exist_ok=True)
         allowed_paths = (
             cast("list[str]", self.store.meta("allowed_paths"))
@@ -284,6 +314,8 @@ class GitPRRuntime(ReportShareRuntime):
             run_id=cast("str", self.control["run_id"]),
             git_pr_enabled=self.git_pr_enabled,
             global_knowledge_enabled=self.global_knowledge_enabled,
+            experiment_memory_enabled=self.experiment_memory_enabled,
+            lanes=cast("tuple[str, ...]", self.lane_names),
             allowed_paths=allowed_paths,
             trusted_evaluator_command=trusted_evaluator_command,
         )
@@ -296,7 +328,10 @@ class GitPRRuntime(ReportShareRuntime):
             self.git_paths.events,
             self.git_paths.bin / "pfc",
             self.git_paths.bin / "pfc_storage.py",
-            *(self.git_paths.system_reports / f"{lane}.jsonl" for lane in LANES),
+            *(
+                self.git_paths.system_reports / f"{lane}.jsonl"
+                for lane in self.lane_names
+            ),
         )
         for path in files:
             try:
@@ -320,25 +355,30 @@ class GitPRRuntime(ReportShareRuntime):
                     f"Git/knowledge runtime directory was replaced: {path}"
                 )
         if self.git_pr_enabled:
-            validate_shadow_repository(self.git_paths)
+            validate_shadow_repository(
+                self.git_paths, cast("tuple[str, ...]", self.lane_names)
+            )
 
     def _workspace_map(self) -> dict[str, object]:
         mapping = super()._workspace_map()
         if not self.git_pr_enabled:
-            if not self.global_knowledge_enabled:
+            if not (self.global_knowledge_enabled or self.experiment_memory_enabled):
                 return mapping
             mapping["factorial_cell"] = {
                 "git_pr_enabled": False,
                 "global_knowledge_enabled": self.global_knowledge_enabled,
+                "experiment_memory_enabled": self.experiment_memory_enabled,
+                "token_efficient_enabled": self.token_efficient_enabled,
+                "main_update_monitor_enabled": self.main_update_monitor_enabled,
             }
-            mapping["knowledge_cli"] = str(self.git_paths.bin / "pfc")
+            mapping["coordination_cli"] = str(self.git_paths.bin / "pfc")
             return mapping
         mapping["lanes"] = {
             lane: {
                 "workspace": str(self.git_paths.lane(lane)),
                 "ownership": "isolated-writable-clone-and-equal-pr-author",
             }
-            for lane in LANES
+            for lane in self.lane_names
         }
         mapping["integration"] = {
             "workspace": str(self.git_paths.integration),
@@ -347,6 +387,9 @@ class GitPRRuntime(ReportShareRuntime):
         mapping["factorial_cell"] = {
             "git_pr_enabled": True,
             "global_knowledge_enabled": self.global_knowledge_enabled,
+            "experiment_memory_enabled": self.experiment_memory_enabled,
+            "token_efficient_enabled": self.token_efficient_enabled,
+            "main_update_monitor_enabled": self.main_update_monitor_enabled,
         }
         mapping["git_pr"] = {
             "central": str(self.git_paths.central),
@@ -399,7 +442,7 @@ class GitPRRuntime(ReportShareRuntime):
             "lane-2": (self.agents.lane_2_actor_a, self.agents.lane_2_actor_b),
             "lane-3": (self.agents.lane_3_actor_a, self.agents.lane_3_actor_b),
         }
-        for lane in LANES:
+        for lane in self.lane_names:
             lane_state = cast("dict[str, Any]", self.control["lanes"][lane])
             self.lanes[lane] = self._make_lane_runtime(
                 lane=lane,
@@ -409,7 +452,11 @@ class GitPRRuntime(ReportShareRuntime):
             )
 
     def _lane_instructions(self, lane: LaneName) -> str:
-        if not (self.git_pr_enabled or self.global_knowledge_enabled):
+        if not (
+            self.git_pr_enabled
+            or self.global_knowledge_enabled
+            or self.experiment_memory_enabled
+        ):
             return ""
         return lane_protocol(
             lane=lane,
@@ -417,11 +464,18 @@ class GitPRRuntime(ReportShareRuntime):
             cli=str(self.git_paths.bin / "pfc"),
             git_pr_enabled=self.git_pr_enabled,
             global_knowledge_enabled=self.global_knowledge_enabled,
+            experiment_memory_enabled=self.experiment_memory_enabled,
+            token_efficient_enabled=self.token_efficient_enabled,
             allowed_paths=self._allowed_paths(),
             knowledge_digest=(
                 self.store.search_knowledge("", limit=KNOWLEDGE_PROMPT_LIMIT)
                 if self.global_knowledge_enabled
                 else []
+            ),
+            experiment_frontier=(
+                self.store.experiment_frontier()
+                if self.experiment_memory_enabled
+                else {}
             ),
         )
 
@@ -489,6 +543,19 @@ class GitPRRuntime(ReportShareRuntime):
             },
             lane=runtime.lane,
         )
+        if self.experiment_memory_enabled:
+            linked = self.store.attach_experiment_report(
+                runtime.lane, cast("str", record["report_id"])
+            )
+            if linked is None:
+                self.store.record_telemetry(
+                    "experiment_report_unlinked",
+                    {
+                        "report_id": record["report_id"],
+                        "status": report.status,
+                    },
+                    lane=runtime.lane,
+                )
         if self.global_knowledge_enabled and candidate_became_best:
             experience = self.store.add_experience(
                 title=(
@@ -507,7 +574,7 @@ class GitPRRuntime(ReportShareRuntime):
             knowledge_state["reviews"] = int(knowledge_state.get("reviews", 0)) + 1
             knowledge_state["last_summary"] = report.summary[:300]
             self._emit_system(
-                targets=LANES,
+                targets=self.lane_names,
                 kind="success_experience_created",
                 summary="The compact digest accepted a new evaluator-backed shared best.",
                 payload={
@@ -758,6 +825,136 @@ class GitPRRuntime(ReportShareRuntime):
             else None
         )
 
+    def _lane_update_context(
+        self, lane: LaneName, *, current: str, changed: list[str]
+    ) -> dict[str, object]:
+        """Inspect one lane cheaply after fetching the new protected main ref."""
+        workspace = self.git_paths.lane(lane)
+        fetch = git(
+            "fetch",
+            "--no-write-fetch-head",
+            "origin",
+            "main:refs/remotes/origin/main",
+            cwd=workspace,
+            check=False,
+        )
+        if fetch.returncode != 0:
+            return {"state": "fetch-busy", "main_sha": current[:12]}
+        head = cast(
+            "subprocess.CompletedProcess[str]",
+            git("rev-parse", "HEAD", cwd=workspace),
+        ).stdout.strip()
+        status = cast(
+            "subprocess.CompletedProcess[str]",
+            git(
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                cwd=workspace,
+                check=False,
+            ),
+        ).stdout.splitlines()
+        counts = (
+            cast(
+                "subprocess.CompletedProcess[str]",
+                git(
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    "HEAD...origin/main",
+                    cwd=workspace,
+                    check=False,
+                ),
+            )
+            .stdout.strip()
+            .split()
+        )
+        divergence: dict[str, int] | None = None
+        if len(counts) == 2 and all(item.isdigit() for item in counts):
+            divergence = {"ahead": int(counts[0]), "behind": int(counts[1])}
+        lane_paths = cast(
+            "subprocess.CompletedProcess[str]",
+            git(
+                "diff",
+                "--name-only",
+                "origin/main...HEAD",
+                cwd=workspace,
+                check=False,
+            ),
+        ).stdout.splitlines()
+        overlap = sorted(set(changed) & set(lane_paths))
+        conflict = "not-checked"
+        if divergence and divergence["ahead"] and divergence["behind"]:
+            merge = git(
+                "merge-tree",
+                "--write-tree",
+                "HEAD",
+                "origin/main",
+                cwd=workspace,
+                check=False,
+            )
+            conflict = "clean" if merge.returncode == 0 else "conflict-likely"
+        return {
+            "head_sha": head[:12],
+            "divergence": divergence,
+            "dirty_paths": len(status),
+            "overlap": overlap[:8],
+            "conflict": conflict,
+        }
+
+    def _notify_main_update(
+        self,
+        *,
+        prior: str,
+        current: str,
+        merged: dict[str, object],
+        changed: list[str],
+        comparison: dict[str, object],
+    ) -> None:
+        """Naturally steer one compact update into every active model turn."""
+        if not self.main_update_monitor_enabled:
+            return
+        score = comparison.get("score")
+        prior_score = comparison.get("prior_score")
+        for lane in self.lane_names:
+            context = self._lane_update_context(lane, current=current, changed=changed)
+            message = (
+                "[Main Update Monitor — runtime event]\n"
+                f"main {prior[:12]} -> {current[:12]}; PR {merged['id']} from "
+                f"{merged['lane']}; score {prior_score} -> {score}; changed "
+                f"{', '.join(changed[:8]) or '(none)'}.\n"
+                f"Your lane state: {json.dumps(context, ensure_ascii=False)}.\n"
+                "Decide briefly whether to rebase, continue the local hypothesis, or combine "
+                "both. Do not answer this event separately and do not stop useful work; record "
+                "the decision in the normal LaneReport."
+            )
+            runtime = self.lanes.get(lane)
+            injected = False
+            error: str | None = None
+            if runtime is not None and runtime.future is not None and runtime.session:
+                try:
+                    runtime.session.interject(message)
+                    injected = True
+                except Exception as why:  # noqa: BLE001 - durable fallback is mandatory
+                    error = f"{type(why).__name__}: {why}"[:1000]
+            if not injected:
+                self._emit_system(
+                    targets=(lane,),
+                    kind="main_update_monitor",
+                    summary=message,
+                    payload={"main_sha": current, "injection_error": error},
+                )
+            self.store.record_telemetry(
+                "main_update_monitor_delivered",
+                {
+                    "main_sha": current,
+                    "delivery": "interject" if injected else "durable-report",
+                    "context": context,
+                    "error": error,
+                },
+                lane=lane,
+            )
+
     def _process_fast_path(self) -> bool:
         """Select the best valid receipt and publish its exact tested tree."""
         if not self.git_pr_enabled:
@@ -909,7 +1106,7 @@ class GitPRRuntime(ReportShareRuntime):
                 self.store.compact_experiences(limit=KNOWLEDGE_DIGEST_LIMIT)
                 experience_id = experience["id"]
             self._emit_system(
-                targets=LANES,
+                targets=self.lane_names,
                 kind="pr_merged",
                 summary=f"{pr_id} was approved and published to the source workspace.",
                 payload={
@@ -925,6 +1122,13 @@ class GitPRRuntime(ReportShareRuntime):
                 kind="receipt_fast_path_feedback",
                 summary=cast("str", comparison.get("summary", "PR merged")),
                 payload={"pr_id": pr_id, "evidence": comparison.get("evidence", [])},
+            )
+            self._notify_main_update(
+                prior=prior,
+                current=current,
+                merged=merged,
+                changed=changed,
+                comparison=cast("dict[str, object]", comparison),
             )
         git_state["observed_main_sha"] = current
         git_state["pending_comparison"] = None
@@ -944,7 +1148,7 @@ class GitPRRuntime(ReportShareRuntime):
             if int(receipt["exit_code"]) == 0:
                 continue
             target: LaneName | None = None
-            if receipt["lane"] in LANES:
+            if receipt["lane"] in self.lane_names:
                 target = cast("LaneName", receipt["lane"])
             elif receipt.get("pr_id"):
                 target = cast(
@@ -1071,7 +1275,7 @@ class GitPRRuntime(ReportShareRuntime):
         changed_ids = [cast("str", fact["id"]) for fact in facts]
         if changed_ids or update_ids or stale or revoked:
             self._emit_system(
-                targets=LANES,
+                targets=self.lane_names,
                 kind="knowledge_updated",
                 summary=result.summary,
                 payload={
@@ -1140,6 +1344,14 @@ class GitPRRuntime(ReportShareRuntime):
             self.git_paths.official_ledger,
             {"version": 1, "entries": self.store.ledger()},
         )
+        atomic_json(
+            self.git_paths.shared / "experiment-memory.json",
+            {
+                "version": 1,
+                "enabled": self.experiment_memory_enabled,
+                "frontier": self.store.experiment_frontier(),
+            },
+        )
 
     def _before_persist(self) -> None:
         super()._before_persist()
@@ -1152,9 +1364,17 @@ class GitPRRuntime(ReportShareRuntime):
             "factorial_cell": {
                 "git_pr_enabled": self.git_pr_enabled,
                 "global_knowledge_enabled": self.global_knowledge_enabled,
+                "experiment_memory_enabled": self.experiment_memory_enabled,
+                "token_efficient_enabled": self.token_efficient_enabled,
+                "main_update_monitor_enabled": self.main_update_monitor_enabled,
             },
             "git_pr": json_copy(self.control.get("git_pr")),
             "knowledge": json_copy(self.control.get("knowledge")),
+            "experiment_memory": (
+                str(self.git_paths.shared / "experiment-memory.json")
+                if self.experiment_memory_enabled
+                else None
+            ),
             "pull_requests": self.store.prs(),
             "official_ledger": str(self.git_paths.official_ledger),
             "knowledge_index": str(self.git_paths.knowledge_json),

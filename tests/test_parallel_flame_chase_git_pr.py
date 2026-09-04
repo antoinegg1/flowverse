@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -213,6 +214,113 @@ def test_fact_dependencies_are_quarantined_and_revoked_transitively(
     assert store.search_knowledge("") == []
 
 
+def test_experiment_memory_classifies_scope_without_git(tmp_path: Path) -> None:
+    store = CoordinationStore(
+        tmp_path / "coordination.sqlite", tmp_path / "events.jsonl"
+    )
+    store.initialize(
+        run_id="memory-run",
+        git_pr_enabled=False,
+        global_knowledge_enabled=False,
+        experiment_memory_enabled=True,
+        allowed_paths=["candidate.py"],
+    )
+    intent = {
+        "family": "scheduler/priority",
+        "target": "build_kernel.schedule",
+        "base_ref": "workspace:one",
+        "parameters": {"bonus": "0..8"},
+    }
+    assert store.check_experiments(**intent)["classification"] == "unseen"
+    record = store.begin_experiment(
+        lane="lane-2",
+        hypothesis="A priority sweep may reduce tail stalls.",
+        **intent,
+    )
+    assert store.check_experiments(**intent)["classification"] == "active"
+    store.finish_experiment(
+        str(record["id"]),
+        lane="lane-2",
+        outcome="exhausted",
+        best_score=1000,
+        coverage_count=9,
+        evidence=["Rfixture"],
+        limitations=["Only one base was measured."],
+        reopen_if=["The scheduling DAG changes."],
+        next_frontier="Try a different engine balance.",
+    )
+    checked = store.check_experiments(**intent)
+    assert checked["classification"] == "covered"
+    assert checked["records"][0]["coverage_count"] == 9
+    assert (
+        store.check_experiments(**{**intent, "base_ref": "workspace:two"})[
+            "classification"
+        ]
+        == "stale"
+    )
+
+
+def test_standalone_memory_evaluation_uses_content_identity(tmp_path: Path) -> None:
+    source = tmp_path / "lane"
+    source.mkdir()
+    (source / "candidate.py").write_text("VALUE = 7\n", encoding="utf-8")
+    (source / "evaluator.py").write_text("print('CYCLES: 7')\n", encoding="utf-8")
+    run_root = tmp_path / "run"
+    shared = run_root / "shared"
+    shared.mkdir(parents=True)
+    store = CoordinationStore(
+        shared / "coordination.sqlite", shared / "coordination-events.jsonl"
+    )
+    store.initialize(
+        run_id="memory-run",
+        git_pr_enabled=False,
+        global_knowledge_enabled=False,
+        experiment_memory_enabled=True,
+        allowed_paths=["candidate.py"],
+        trusted_evaluator_command=["python", "evaluator.py"],
+    )
+    implementation = Path(__file__).parents[1] / "flows" / "parallel_flame_chase_git_pr"
+    bin_dir = run_root / "bin"
+    bin_dir.mkdir()
+    cli = bin_dir / "pfc"
+    shutil.copy2(implementation / "agent_cli.py", cli)
+    shutil.copy2(implementation / "storage.py", bin_dir / "pfc_storage.py")
+    cli.chmod(0o755)
+    common = (str(cli), "--run-root", str(run_root), "--lane", "lane-1")
+    evaluated = command(*common, "evaluate", "--", "python", "evaluator.py", cwd=source)
+    receipt = json.loads(evaluated.stdout.splitlines()[-1])
+    assert receipt["commit_sha"].startswith("workspace:")
+    begun = command(
+        *common,
+        "experiment",
+        "begin",
+        "--family",
+        "constants",
+        "--target",
+        "candidate.py",
+        "--base",
+        "auto",
+        "--hypothesis",
+        "Measure the constant.",
+        "--parameters-json",
+        '{"value":7}',
+        cwd=source,
+    )
+    experiment_id = json.loads(begun.stdout)["id"]
+    finished = command(
+        *common,
+        "experiment",
+        "finish",
+        experiment_id,
+        "--outcome",
+        "improved",
+        "--evidence",
+        receipt["receipt_id"],
+        cwd=source,
+    )
+    assert json.loads(finished.stdout)["best_score"] == 7
+
+
 PLAN = InitialPlan(
     lanes=[
         LaneBrief(
@@ -234,6 +342,7 @@ class FakeSession:
     def __init__(self, agent: FakeAgent, cwd: Path) -> None:
         self.agent = agent
         self.cwd = cwd
+        self.interjections: list[str] = []
 
     def __call__(self, prompt: str, *, suppress: bool, schema: type[Any]) -> Any:
         self.agent.prompts.append((self.cwd, prompt, schema))
@@ -249,6 +358,9 @@ class FakeSession:
 
     def close(self) -> None:
         pass
+
+    def interject(self, text: str) -> None:
+        self.interjections.append(text)
 
 
 class FakeAgent:
@@ -359,3 +471,120 @@ def test_git_runtime_gives_every_lane_an_isolated_clone(
     assert state["global_knowledge_enabled"] is False
     assert main_sha(root / "shared" / "repository.git") == baseline
     assert resumed.orchestrateor.prompts == []  # type: ignore[attr-defined]
+
+
+def test_experiment_memory_runtime_is_independent_of_git(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "candidate.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(runtime_state, "home", lambda: tmp_path / "humanize-home")
+    chosen = agents()
+    state: dict[str, Any] = {}
+    execute(
+        chosen,
+        "Improve candidate.py.",
+        Config(
+            rest_seconds=0.05,
+            git_pr_enabled=False,
+            global_knowledge_enabled=False,
+            experiment_memory_enabled=True,
+        ),
+        state,
+        _sleep=lambda _: time.sleep(0.002),
+        _max_turns=3,
+    )
+
+    root = Path(state["run_root"])
+    assert state["git_pr_enabled"] is False
+    assert state["experiment_memory_enabled"] is True
+    assert not (root / "shared" / "repository.git").exists()
+    prompt = chosen.lane_1_actor_a.prompts[0][1]  # type: ignore[attr-defined]
+    assert "Experiment Memory Lite" in prompt
+    assert "independent of Git/PR" in prompt
+    assert "experiment check" in prompt
+
+
+def test_token_efficient_prompt_removes_redundant_model_checks(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "candidate.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(runtime_state, "home", lambda: tmp_path / "humanize-home")
+    chosen = agents()
+    state: dict[str, Any] = {}
+    execute(
+        chosen,
+        "Improve candidate.py.",
+        Config(
+            rest_seconds=0.05,
+            git_pr_enabled=True,
+            global_knowledge_enabled=False,
+            token_efficient_enabled=True,
+        ),
+        state,
+        _sleep=lambda _: time.sleep(0.002),
+        _max_turns=3,
+    )
+    prompt = chosen.lane_1_actor_a.prompts[0][1]  # type: ignore[attr-defined]
+    assert "Token-efficient protocol" in prompt
+    assert "do not rerun it when the relevant" in prompt
+
+
+def test_main_update_monitor_interjects_active_lane_sessions(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "candidate.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.chdir(source)
+    monkeypatch.setattr(runtime_state, "home", lambda: tmp_path / "humanize-home")
+    runtime = GitPRRuntime(
+        agents(),
+        "Improve candidate.py.",
+        Config(
+            rest_seconds=0.05,
+            git_pr_enabled=True,
+            global_knowledge_enabled=False,
+            main_update_monitor_enabled=True,
+        ),
+        {},
+    )
+    try:
+        runtime.prepare()
+        baseline = main_sha(runtime.git_paths.central)
+        sessions: list[FakeSession] = []
+        for lane_runtime in runtime.lanes.values():
+            session = FakeSession(FakeAgent(), lane_runtime.workspace)
+            lane_runtime.session = session  # type: ignore[assignment]
+            lane_runtime.future = object()  # type: ignore[assignment]
+            sessions.append(session)
+        runtime._notify_main_update(
+            prior=baseline,
+            current=baseline,
+            merged={"id": "PR000001", "lane": "lane-2"},
+            changed=["candidate.py"],
+            comparison={"prior_score": 100, "score": 90},
+        )
+        assert all(len(session.interjections) == 1 for session in sessions)
+        assert all(
+            "Do not answer this event separately" in session.interjections[0]
+            for session in sessions
+        )
+        delivered = [
+            event
+            for event in runtime.store.telemetry()
+            if event["kind"] == "main_update_monitor_delivered"
+        ]
+        assert len(delivered) == 3
+        assert {
+            event["payload"]["delivery"]  # type: ignore[index]
+            for event in delivered
+        } == {"interject"}
+    finally:
+        runtime._close_sessions()
+        runtime.executor.shutdown(wait=True, cancel_futures=True)

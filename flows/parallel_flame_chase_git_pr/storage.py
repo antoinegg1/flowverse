@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from types import TracebackType
 from typing import TYPE_CHECKING, cast
@@ -14,9 +15,22 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
     from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PR_STATES = {"draft", "ready", "reviewing", "merged", "rejected"}
 FACT_STATES = {"proposed", "verified", "conflicted", "stale", "revoked"}
+EXPERIMENT_OUTCOMES = {
+    "active",
+    "improved",
+    "neutral",
+    "regressed",
+    "invalid",
+    "exhausted",
+}
+
+
+def re_split_words(value: str) -> list[str]:
+    """Normalize free-form intent text for deterministic lexical retrieval."""
+    return re.findall(r"[\w.-]+", value.casefold())
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -103,6 +117,8 @@ class CoordinationStore:
         run_id: str,
         git_pr_enabled: bool,
         global_knowledge_enabled: bool,
+        experiment_memory_enabled: bool = False,
+        lanes: Sequence[str] = ("lane-1", "lane-2", "lane-3"),
         allowed_paths: Sequence[str],
         trusted_evaluator_command: Sequence[str] = (),
     ) -> None:
@@ -206,6 +222,27 @@ class CoordinationStore:
                     lane TEXT,
                     payload_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS experiments (
+                    id TEXT PRIMARY KEY,
+                    lane TEXT NOT NULL,
+                    family TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    base_ref TEXT NOT NULL,
+                    hypothesis TEXT NOT NULL,
+                    parameters_json TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    best_score REAL,
+                    coverage_count INTEGER NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    limitations_json TEXT NOT NULL,
+                    reopen_if_json TEXT NOT NULL,
+                    next_frontier TEXT NOT NULL,
+                    report_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS experiments_scope
+                    ON experiments(family, target, base_ref, outcome);
                 """
             )
             expected = {
@@ -213,6 +250,8 @@ class CoordinationStore:
                 "run_id": run_id,
                 "git_pr_enabled": git_pr_enabled,
                 "global_knowledge_enabled": global_knowledge_enabled,
+                "experiment_memory_enabled": experiment_memory_enabled,
+                "lanes": list(lanes),
                 "allowed_paths": list(allowed_paths),
                 "trusted_evaluator_command": list(trusted_evaluator_command),
             }
@@ -1141,6 +1180,291 @@ class CoordinationStore:
             "experiences": [item for item in visible if item["kind"] == "experience"],
         }
 
+    @staticmethod
+    def _decode_experiment(row: dict[str, object]) -> dict[str, object]:
+        for field in (
+            "parameters_json",
+            "evidence_json",
+            "limitations_json",
+            "reopen_if_json",
+        ):
+            row[field.removesuffix("_json")] = json.loads(cast("str", row.pop(field)))
+        return row
+
+    def begin_experiment(
+        self,
+        *,
+        lane: str,
+        family: str,
+        target: str,
+        base_ref: str,
+        hypothesis: str,
+        parameters: object,
+    ) -> dict[str, object]:
+        """Open one soft lane-local experiment lease without suppressing other lanes."""
+        stamp = timestamp()
+        identity = {
+            "lane": lane,
+            "family": family,
+            "target": target,
+            "base_ref": base_ref,
+            "hypothesis": hypothesis,
+            "parameters": parameters,
+            "created_at": stamp,
+        }
+        experiment_id = content_id("X", identity)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT id FROM experiments WHERE lane=? AND outcome='active'",
+                (lane,),
+            ).fetchone()
+            if active is not None:
+                raise ValueError(
+                    f"{lane} already has active experiment {active['id']}; finish it first"
+                )
+            connection.execute(
+                """
+                INSERT INTO experiments(
+                    id, lane, family, target, base_ref, hypothesis, parameters_json,
+                    outcome, best_score, coverage_count, evidence_json,
+                    limitations_json, reopen_if_json, next_frontier, report_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, 0, '[]', '[]', '[]',
+                    '', NULL, ?, ?)
+                """,
+                (
+                    experiment_id,
+                    lane,
+                    family,
+                    target,
+                    base_ref,
+                    hypothesis,
+                    canonical_json(parameters),
+                    stamp,
+                    stamp,
+                ),
+            )
+            event = self._event(
+                connection,
+                "experiment_started",
+                lane=lane,
+                payload={
+                    "experiment_id": experiment_id,
+                    "family": family,
+                    "target": target,
+                    "base_ref": base_ref,
+                },
+            )
+        append_event(self.events, event)
+        return self.experiment(experiment_id)
+
+    def finish_experiment(
+        self,
+        experiment_id: str,
+        *,
+        lane: str,
+        outcome: str,
+        best_score: float | None,
+        coverage_count: int,
+        evidence: Sequence[str],
+        limitations: Sequence[str],
+        reopen_if: Sequence[str],
+        next_frontier: str,
+    ) -> dict[str, object]:
+        """Close one active record with explicit bounded evidence and reopening scope."""
+        if outcome not in EXPERIMENT_OUTCOMES - {"active"}:
+            raise ValueError(f"invalid experiment outcome: {outcome}")
+        if coverage_count < 0:
+            raise ValueError("coverage_count must be non-negative")
+        if outcome == "exhausted" and coverage_count < 1:
+            raise ValueError("exhausted requires a positive coverage_count")
+        stamp = timestamp()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM experiments WHERE id=?", (experiment_id,)
+            ).fetchone()
+            if row is None or row["lane"] != lane or row["outcome"] != "active":
+                raise ValueError(
+                    "only the owning lane may finish its active experiment"
+                )
+            connection.execute(
+                """
+                UPDATE experiments SET outcome=?, best_score=?, coverage_count=?,
+                    evidence_json=?, limitations_json=?, reopen_if_json=?,
+                    next_frontier=?, updated_at=? WHERE id=?
+                """,
+                (
+                    outcome,
+                    best_score,
+                    coverage_count,
+                    canonical_json(list(evidence)),
+                    canonical_json(list(limitations)),
+                    canonical_json(list(reopen_if)),
+                    next_frontier,
+                    stamp,
+                    experiment_id,
+                ),
+            )
+            event = self._event(
+                connection,
+                "experiment_finished",
+                lane=lane,
+                payload={
+                    "experiment_id": experiment_id,
+                    "outcome": outcome,
+                    "best_score": best_score,
+                    "coverage_count": coverage_count,
+                },
+            )
+        append_event(self.events, event)
+        return self.experiment(experiment_id)
+
+    def experiment(self, experiment_id: str) -> dict[str, object]:
+        """Return one experiment-memory record."""
+        with self.connect(readonly=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM experiments WHERE id=?", (experiment_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(experiment_id)
+        return self._decode_experiment(dict(row))
+
+    def active_experiment(self, lane: str) -> dict[str, object] | None:
+        """Return a lane's unique active soft lease."""
+        with self.connect(readonly=True) as connection:
+            rows = connection.execute(
+                "SELECT * FROM experiments WHERE lane=? AND outcome='active'",
+                (lane,),
+            ).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError(f"{lane} has multiple active experiments")
+        return self._decode_experiment(dict(rows[0])) if rows else None
+
+    def attach_experiment_report(self, lane: str, report_id: str) -> str | None:
+        """Link a just-published report to the lane's most recently touched record."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id FROM experiments
+                WHERE lane=? AND report_id IS NULL
+                ORDER BY updated_at DESC, created_at DESC LIMIT 1
+                """,
+                (lane,),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE experiments SET report_id=?, updated_at=? WHERE id=?",
+                (report_id, timestamp(), row["id"]),
+            )
+            event = self._event(
+                connection,
+                "experiment_report_attached",
+                lane=lane,
+                payload={"experiment_id": row["id"], "report_id": report_id},
+            )
+        append_event(self.events, event)
+        return cast("str", row["id"])
+
+    def check_experiments(
+        self,
+        *,
+        family: str,
+        target: str,
+        base_ref: str,
+        parameters: object,
+        limit: int = 3,
+    ) -> dict[str, object]:
+        """Classify an intent and return only its most relevant run-local records."""
+        if not 1 <= limit <= 20:
+            raise ValueError("experiment result limit must be between 1 and 20")
+        with self.connect(readonly=True) as connection:
+            rows = connection.execute(
+                "SELECT * FROM experiments ORDER BY updated_at DESC, id"
+            ).fetchall()
+        records = [self._decode_experiment(dict(row)) for row in rows]
+        exact_scope = [
+            record
+            for record in records
+            if record["family"] == family and record["target"] == target
+        ]
+        exact_base = [
+            record for record in exact_scope if record["base_ref"] == base_ref
+        ]
+        exact_parameters = canonical_json(parameters)
+        exact = [
+            record
+            for record in exact_base
+            if canonical_json(record["parameters"]) == exact_parameters
+        ]
+        terminal_exact = [record for record in exact if record["outcome"] != "active"]
+        outcomes = {record["outcome"] for record in terminal_exact}
+        positive = bool(outcomes & {"improved"})
+        negative = bool(outcomes & {"neutral", "regressed", "exhausted"})
+        if positive and negative:
+            classification = "conflicted"
+        elif any(record["outcome"] == "active" for record in exact):
+            classification = "active"
+        elif terminal_exact:
+            classification = "covered"
+        elif exact_base:
+            classification = "partial"
+        elif exact_scope:
+            classification = "stale"
+        else:
+            classification = "unseen"
+
+        terms = {
+            item
+            for item in re_split_words(
+                " ".join((family, target, canonical_json(parameters)))
+            )
+            if item
+        }
+        ranked: list[tuple[int, str, dict[str, object]]] = []
+        for record in records:
+            haystack = set(re_split_words(canonical_json(record)))
+            score = len(terms & haystack)
+            score += 20 if record["family"] == family else 0
+            score += 12 if record["target"] == target else 0
+            score += 5 if record["base_ref"] == base_ref else 0
+            if score:
+                ranked.append((score, cast("str", record["updated_at"]), record))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return {
+            "classification": classification,
+            "intent": {
+                "family": family,
+                "target": target,
+                "base_ref": base_ref,
+                "parameters": parameters,
+            },
+            "records": [record for _score, _updated, record in ranked[:limit]],
+        }
+
+    def experiment_frontier(self) -> dict[str, object]:
+        """Return a tiny prompt-safe board; terminal details stay on demand."""
+        with self.connect(readonly=True) as connection:
+            counts = {
+                row["outcome"]: int(row["count"])
+                for row in connection.execute(
+                    "SELECT outcome, COUNT(*) AS count FROM experiments GROUP BY outcome"
+                )
+            }
+            active = [
+                self._decode_experiment(dict(row))
+                for row in connection.execute(
+                    """
+                    SELECT * FROM experiments WHERE outcome='active'
+                    ORDER BY created_at, id
+                    """
+                )
+            ]
+        return {"counts": counts, "active": active}
+
     def ledger(self) -> list[dict[str, object]]:
         """Return the immutable official-main history."""
         with self.connect(readonly=True) as connection:
@@ -1168,6 +1492,7 @@ class CoordinationStore:
 
 
 __all__ = [
+    "EXPERIMENT_OUTCOMES",
     "FACT_STATES",
     "PR_STATES",
     "SCHEMA_VERSION",

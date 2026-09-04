@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,7 +26,6 @@ except ModuleNotFoundError:  # pragma: no cover - used from the source checkout
         timestamp,
     )
 
-LANES = {"lane-1", "lane-2", "lane-3"}
 PROTECTED_PREFIXES = (".git", ".flowbench", ".pfc")
 SECRET_MARKERS = (
     "AUTH",
@@ -36,6 +36,14 @@ SECRET_MARKERS = (
     "SECRET",
     "TOKEN",
 )
+EXPERIMENT_TERMINAL_OUTCOMES = {
+    "improved",
+    "neutral",
+    "regressed",
+    "invalid",
+    "exhausted",
+}
+CYCLES_PATTERN = re.compile(r"(?im)^\s*CYCLES\s*:\s*([0-9]+)\s*$")
 
 
 def run_git(*arguments: str, cwd: Path | None = None, check: bool = True) -> str:
@@ -120,7 +128,7 @@ class Context:
 
     @property
     def is_lane(self) -> bool:
-        return self.lane in LANES
+        return self.lane in set(self.store.meta("lanes"))
 
     @property
     def is_orchestrateor(self) -> bool:
@@ -145,6 +153,25 @@ def clean_head(repository: Path) -> tuple[str, str]:
     )
 
 
+def workspace_identity(root: Path, patterns: list[str]) -> str:
+    """Hash only frozen task paths for a non-Git Experiment Memory lane."""
+    entries: list[tuple[str, str]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if allowed_path(relative, patterns):
+            entries.append((relative, sha256_file(path)))
+    return "workspace:" + hashlib.sha256(canonical_json(entries).encode()).hexdigest()
+
+
+def current_base_ref(context: Context) -> str:
+    """Resolve a Git commit or content identity without introducing Git inheritance."""
+    if bool(context.store.meta("git_pr_enabled")):
+        return clean_head(repository_root(context))[0]
+    return workspace_identity(context.cwd, list(context.store.meta("allowed_paths")))
+
+
 def environment_hash() -> str:
     visible = {
         key: value
@@ -167,8 +194,15 @@ def command_evaluate(context: Context, arguments: argparse.Namespace) -> int:
     if not arguments.command:
         raise ValueError("evaluate requires a command after --")
 
-    repository = repository_root(context)
-    commit_sha, tree_sha = clean_head(repository)
+    git_enabled = bool(context.store.meta("git_pr_enabled"))
+    repository = repository_root(context) if git_enabled else None
+    if repository is None:
+        commit_sha = workspace_identity(
+            context.cwd, list(context.store.meta("allowed_paths"))
+        )
+        tree_sha = commit_sha.removeprefix("workspace:")
+    else:
+        commit_sha, tree_sha = clean_head(repository)
     started_at = timestamp()
     artifact_root = context.shared / "evaluations"
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -190,11 +224,18 @@ def command_evaluate(context: Context, arguments: argparse.Namespace) -> int:
             )
         finished_at = timestamp()
         exit_code = result.returncode
-        after_status = run_git(
-            "status", "--porcelain", "--untracked-files=all", cwd=repository
+        changed = (
+            workspace_identity(context.cwd, list(context.store.meta("allowed_paths")))
+            != commit_sha
+            if repository is None
+            else bool(
+                run_git(
+                    "status", "--porcelain", "--untracked-files=all", cwd=repository
+                )
+                or run_git("rev-parse", "HEAD", cwd=repository) != commit_sha
+            )
         )
-        after_commit = run_git("rev-parse", "HEAD", cwd=repository)
-        if after_status or after_commit != commit_sha:
+        if changed:
             with stderr_file.open("ab") as handle:
                 handle.write(
                     b"\nPFC recorder: evaluator changed the clean commit/worktree; "
@@ -457,6 +498,188 @@ def command_knowledge_get(context: Context, arguments: argparse.Namespace) -> in
     return 0
 
 
+def require_experiment_memory(context: Context) -> None:
+    if not bool(context.store.meta("experiment_memory_enabled")):
+        raise ValueError("Experiment Memory Lite is disabled in this cell")
+    if not context.is_lane:
+        raise ValueError("only research lanes may update Experiment Memory Lite")
+
+
+def experiment_parameters(raw: str) -> object:
+    if len(raw.encode()) > 16_384:
+        raise ValueError("experiment parameters exceed 16 KiB")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as why:
+        raise ValueError("--parameters-json must be valid JSON") from why
+    if not isinstance(value, (dict, list)):
+        raise TypeError("--parameters-json must be an object or array")
+    return value
+
+
+def resolve_base(context: Context, raw: str) -> str:
+    value = current_base_ref(context) if raw == "auto" else raw.strip()
+    if not 1 <= len(value) <= 200:
+        raise ValueError("experiment base reference must contain 1..200 characters")
+    return value
+
+
+def validate_intent_text(arguments: argparse.Namespace) -> None:
+    for field, limit in (("family", 200), ("target", 500), ("hypothesis", 4000)):
+        value = getattr(arguments, field).strip()
+        if not value or len(value) > limit:
+            raise ValueError(
+                f"--{field.replace('_', '-')} must contain 1..{limit} characters"
+            )
+        setattr(arguments, field, value)
+
+
+def command_experiment_check(context: Context, arguments: argparse.Namespace) -> int:
+    require_experiment_memory(context)
+    validate_intent_text(arguments)
+    parameters = experiment_parameters(arguments.parameters_json)
+    base_ref = resolve_base(context, arguments.base)
+    result = context.store.check_experiments(
+        family=arguments.family,
+        target=arguments.target,
+        base_ref=base_ref,
+        parameters=parameters,
+        limit=3,
+    )
+    context.store.record_telemetry(
+        "experiment_intent_checked",
+        {
+            "classification": result["classification"],
+            "family": arguments.family,
+            "target": arguments.target,
+            "base_ref": base_ref,
+            "returned_ids": [item["id"] for item in result["records"]],
+        },
+        lane=context.lane,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_experiment_begin(context: Context, arguments: argparse.Namespace) -> int:
+    require_experiment_memory(context)
+    validate_intent_text(arguments)
+    parameters = experiment_parameters(arguments.parameters_json)
+    base_ref = resolve_base(context, arguments.base)
+    checked = context.store.check_experiments(
+        family=arguments.family,
+        target=arguments.target,
+        base_ref=base_ref,
+        parameters=parameters,
+        limit=3,
+    )
+    classification = str(checked["classification"])
+    if classification in {"covered", "conflicted"} and not arguments.reopen_reason:
+        raise ValueError(
+            "covered/conflicted work may be reopened, but --reopen-reason is required"
+        )
+    record = context.store.begin_experiment(
+        lane=context.lane,
+        family=arguments.family,
+        target=arguments.target,
+        base_ref=base_ref,
+        hypothesis=arguments.hypothesis,
+        parameters=parameters,
+    )
+    if arguments.reopen_reason:
+        context.store.record_telemetry(
+            "experiment_scope_reopened",
+            {
+                "experiment_id": record["id"],
+                "prior_classification": classification,
+                "reason": arguments.reopen_reason,
+            },
+            lane=context.lane,
+        )
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+    return 0
+
+
+def evidence_score(
+    context: Context, evidence: list[str], *, allow_failed: bool
+) -> float | None:
+    if not evidence:
+        raise ValueError("experiment finish requires at least one evidence reference")
+    scores: list[int] = []
+    object_root = (context.shared / "objects" / "sha256").resolve()
+    for reference in evidence:
+        if reference.startswith("R"):
+            receipt = context.store.receipt(reference)
+            if receipt["lane"] != context.lane:
+                raise ValueError("a lane may cite only its own evaluator receipt")
+            if int(receipt["exit_code"]) != 0 and not allow_failed:
+                raise ValueError("non-invalid outcomes require successful receipts")
+            path = Path(str(receipt["stdout_path"]))
+            if path.is_file() and not path.is_symlink():
+                scores.extend(
+                    int(value)
+                    for value in CYCLES_PATTERN.findall(
+                        path.read_text(encoding="utf-8", errors="replace")
+                    )
+                )
+            continue
+        if reference.startswith("sha256:"):
+            digest = reference.removeprefix("sha256:")
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("invalid sha256 evidence reference")
+            path = object_root / digest[:2] / digest
+            if not path.is_file() or path.is_symlink() or sha256_file(path) != digest:
+                raise ValueError("sha256 evidence object is missing or corrupt")
+            continue
+        raise ValueError("evidence must be an evaluator receipt ID or sha256:<digest>")
+    return float(scores[-1]) if scores else None
+
+
+def command_experiment_finish(context: Context, arguments: argparse.Namespace) -> int:
+    require_experiment_memory(context)
+    if arguments.outcome not in EXPERIMENT_TERMINAL_OUTCOMES:
+        raise ValueError("invalid experiment outcome")
+    derived_score = evidence_score(
+        context, arguments.evidence, allow_failed=arguments.outcome == "invalid"
+    )
+    best_score = (
+        arguments.best_score if arguments.best_score is not None else derived_score
+    )
+    if arguments.outcome == "improved" and best_score is None:
+        raise ValueError("improved requires a measured --best-score or scored receipt")
+    record = context.store.finish_experiment(
+        arguments.experiment_id,
+        lane=context.lane,
+        outcome=arguments.outcome,
+        best_score=best_score,
+        coverage_count=arguments.coverage_count,
+        evidence=arguments.evidence,
+        limitations=arguments.limitation,
+        reopen_if=arguments.reopen_if,
+        next_frontier=arguments.next_frontier,
+    )
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_experiment_show(context: Context, arguments: argparse.Namespace) -> int:
+    require_experiment_memory(context)
+    print(
+        json.dumps(
+            context.store.experiment(arguments.experiment_id),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def command_experiment_status(context: Context, _arguments: argparse.Namespace) -> int:
+    require_experiment_memory(context)
+    print(json.dumps(context.store.experiment_frontier(), ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_artifact_put(context: Context, arguments: argparse.Namespace) -> int:
     source = Path(arguments.path).expanduser().resolve(strict=True)
     if not source.is_file() or source.is_symlink():
@@ -524,6 +747,42 @@ def parser() -> argparse.ArgumentParser:
     knowledge_get = knowledge_commands.add_parser("get")
     knowledge_get.add_argument("knowledge_id")
     knowledge_get.set_defaults(handler=command_knowledge_get)
+
+    experiment = commands.add_parser("experiment")
+    experiment_commands = experiment.add_subparsers(
+        dest="experiment_command", required=True
+    )
+    experiment_check = experiment_commands.add_parser("check")
+    experiment_begin = experiment_commands.add_parser("begin")
+    for intent in (experiment_check, experiment_begin):
+        intent.add_argument("--family", required=True)
+        intent.add_argument("--target", required=True)
+        intent.add_argument("--base", default="auto")
+        intent.add_argument("--hypothesis", required=True)
+        intent.add_argument("--parameters-json", required=True)
+    experiment_check.set_defaults(handler=command_experiment_check)
+    experiment_begin.add_argument(
+        "--reopen-reason",
+        choices=("changed-base", "new-range", "new-interaction", "evidence-gap"),
+    )
+    experiment_begin.set_defaults(handler=command_experiment_begin)
+    experiment_finish = experiment_commands.add_parser("finish")
+    experiment_finish.add_argument("experiment_id")
+    experiment_finish.add_argument(
+        "--outcome", required=True, choices=sorted(EXPERIMENT_TERMINAL_OUTCOMES)
+    )
+    experiment_finish.add_argument("--best-score", type=float)
+    experiment_finish.add_argument("--coverage-count", type=int, default=0)
+    experiment_finish.add_argument("--evidence", action="append", default=[])
+    experiment_finish.add_argument("--limitation", action="append", default=[])
+    experiment_finish.add_argument("--reopen-if", action="append", default=[])
+    experiment_finish.add_argument("--next-frontier", default="")
+    experiment_finish.set_defaults(handler=command_experiment_finish)
+    experiment_show = experiment_commands.add_parser("show")
+    experiment_show.add_argument("experiment_id")
+    experiment_show.set_defaults(handler=command_experiment_show)
+    experiment_status = experiment_commands.add_parser("status")
+    experiment_status.set_defaults(handler=command_experiment_status)
 
     artifact = commands.add_parser("artifact")
     artifact_commands = artifact.add_subparsers(dest="artifact_command", required=True)

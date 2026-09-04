@@ -182,11 +182,21 @@ def test_additive_flows_keep_original_entries_and_use_orchestrateor() -> None:
         "resume_mode",
         "git_pr_enabled",
         "global_knowledge_enabled",
+        "experiment_memory_enabled",
+        "token_efficient_enabled",
+        "main_update_monitor_enabled",
     }
     assert [skill.name for skill in brought(git_pr.parent)] == [
         "parallel-flame-chase-git-pr"
     ]
     assert "parallel_flame_chase_git_pr" in names
+    assert {
+        "parallel_flame_chase_git_pr_token_efficient",
+        "parallel_ralph_git_pr_2way",
+        "parallel_ralph_git_pr_4way",
+        "parallel_flame_chase_git_pr_main_monitor",
+        "parallel_flame_chase_git_pr_token_efficient_main_monitor",
+    } <= names
 
 
 def test_mission_lite_only_escalates_terminal_audit_for_shared_best() -> None:
