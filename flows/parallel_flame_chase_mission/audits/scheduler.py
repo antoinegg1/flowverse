@@ -137,8 +137,6 @@ class AuditScheduler(MissionScheduler):
         coordinator_packet = compact_audit_packet(
             packet,
             max_prompt_chars=AUDIT_PROMPT_MAX_CHARS,
-            skill=self.skill_name,
-            role_name=self.orchestrator_role_name,
         )
         projection = coordinator_packet.get("_prompt_projection")
         if isinstance(projection, dict):
@@ -146,8 +144,6 @@ class AuditScheduler(MissionScheduler):
         coordinator_packet = compact_audit_packet(
             coordinator_packet,
             max_prompt_chars=AUDIT_PROMPT_MAX_CHARS,
-            skill=self.skill_name,
-            role_name=self.orchestrator_role_name,
         )
         atomic_json(
             directory / f"coordinator-packet-r{revision}.json",
@@ -184,8 +180,6 @@ class AuditScheduler(MissionScheduler):
                 run_audit_session,
                 session,
                 packet,
-                skill=self.skill_name,
-                role_name=self.orchestrator_role_name,
             )
         except Stopped:
             raise

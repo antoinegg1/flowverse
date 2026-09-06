@@ -44,10 +44,6 @@ class LaneScheduler(RuntimeState):
         """Return a specialized Lane 1 handoff, if the mode defines one."""
         return None
 
-    def _previous_lane_report(self, lane: LaneName) -> dict[str, object] | None:
-        """Return an optional same-lane handoff for additive report-share modes."""
-        return None
-
     def _after_lane_scheduled(self, runtime: LaneRuntime) -> None:
         """Reset mode-specific ephemeral fields for a new turn."""
 
@@ -56,8 +52,6 @@ class LaneScheduler(RuntimeState):
         runtime: LaneRuntime,
         record: dict[str, object],
         report: LaneReport,
-        *,
-        candidate_became_best: bool,
     ) -> None:
         """Apply mode-specific state transitions after a valid report."""
         if report.status == "blocked":
@@ -107,7 +101,6 @@ class LaneScheduler(RuntimeState):
                 "last_error": durable.get("last_error"),
             },
             skill=self.skill_name,
-            previous_lane_report=self._previous_lane_report(lane),
         )
         runtime.identity = identity
         runtime.pending_ack = acknowledgements
@@ -201,12 +194,7 @@ class LaneScheduler(RuntimeState):
         durable["next_actor"] = 1 - runtime.actor_at
         durable["consecutive_failures"] = 0
         durable["last_error"] = None
-        self._observe_report(
-            runtime,
-            record,
-            report,
-            candidate_became_best=became_best,
-        )
+        self._observe_report(runtime, record, report)
         self.completed_turns += 1
 
     def _record_failure(self, runtime: LaneRuntime, error: str) -> None:
