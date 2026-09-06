@@ -97,27 +97,29 @@ def _main_sha(repository: Path) -> str:
 def _gate_for_submission(
     registry: dict[str, Any], database: Path, pr_id: str | None
 ) -> str | None:
-    """Bind a PR to the newest gate already active when that PR was opened."""
+    """Bind a PR attempt to the newest gate active when it entered CI."""
     if not pr_id:
         current = registry.get("current")
         return current if isinstance(current, str) else None
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     try:
         row = connection.execute(
-            "SELECT created_at FROM pull_requests WHERE id=?", (pr_id,)
+            "SELECT COALESCE(ci_submitted_at, created_at) "
+            "FROM pull_requests WHERE id=?",
+            (pr_id,),
         ).fetchone()
     finally:
         connection.close()
     if row is None:
         raise ValueError(f"unknown PR identity: {pr_id}")
-    created_at = str(row[0])
+    submitted_at = str(row[0])
     eligible = [
         item
         for item in registry.get("history", [])
         if isinstance(item, dict)
         and isinstance(item.get("commit"), str)
         and isinstance(item.get("activated_at"), str)
-        and item["activated_at"] <= created_at
+        and item["activated_at"] <= submitted_at
     ]
     return str(eligible[-1]["commit"]) if eligible else None
 

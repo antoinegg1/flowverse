@@ -23,23 +23,24 @@ def lane_protocol(
     evaluator = " ".join(shlex.quote(item) for item in evaluator_command)
     return f"""This lane owns exactly this writable Git clone. Start each experiment from the
 latest `origin/main` on `{lane}/<experiment>`. You may submit freely; no lane is a privileged
-integrator. Commit and push the exact branch, then open the draft before evaluating so the gate
-receipt is bound to the submission:
+integrator. Commit and push the exact branch, open one draft PR, then submit that PR to the
+run-local CI check:
 
   {prefix} pr open --draft --title "..." --hypothesis "..."
-  {prefix} evaluate --pr PRxxxxxx -- {evaluator}
-  {prefix} pr ready PRxxxxxx --receipt R...
+  {prefix} pr submit PRxxxxxx
 
-The stable command dispatches to whichever coordinator-authored gate was active when the PR was
-opened. A PR opened before the first gate commit uses the task's baseline evaluator. A successful
+CI checks out the exact pushed commit from the central Git repository in an isolated workspace and
+runs the frozen evaluator `{evaluator}`. The branch is frozen while CI or review is active. CI
+dispatches to whichever coordinator-authored gate was active at that submission attempt; a
+submission before the first gate activation uses the task's baseline evaluator. A successful CI
 receipt is still audited by the coordinator for evaluator/real-objective alignment, leakage,
 overfitting, and wrong-PR behavior; passing audits merge automatically as the exact tested tree.
-If main or the gate changes, rebase and obtain a fresh receipt. Do not rewrite a ready PR head.
 
-Gate failures and PR rejections are private feedback: only this lane and the coordinator receive
-them. Use the diagnostic to repair the candidate; do not broadcast failed details as shared
-knowledge. The frozen task path patterns are {document(allowed_paths)}. `.git`, `.flowbench`, and
-`.pfc` are protected from lane PRs. Never edit or push the coordinator gate ref."""
+If CI or the coordinator audit fails, the same PR returns to `draft`, the branch unlocks, and only
+this lane plus the coordinator receive the diagnostic. Modify that same branch, commit and push,
+then run `pr submit` on the same PR again. Rebase first when main changed. Do not broadcast failed
+details as shared knowledge. The frozen task path patterns are {document(allowed_paths)}. `.git`,
+`.flowbench`, and `.pfc` are protected from lane PRs. Never edit or push the coordinator gate ref."""
 
 
 def git_planning_prompt(
@@ -81,7 +82,8 @@ smallest useful PR proxy evaluator for this task type. It must compare candidate
 main, preserve the official metric direction and validation protocol, include robustness/leakage
 checks, and emit the exact structured result in the skill contract.
 
-Write only `.pfc/adaptive-eval/**` in this planning clone. Run its self-test. Commit it as a
+Write only `.pfc/adaptive-eval/**` in this planning clone. This bundle is the PR CI gate used by
+the existing local Git/PR mechanism. Run its self-test. Commit it as a
 one-parent commit and push `HEAD:{gate_ref}`. For the first gate, branch from `origin/main`; for a
 later repair, branch from `origin/pfc/eval-gate`. Return `published` only with the full pushed
 commit SHA. If evidence cannot justify semantic alignment, return `deferred` and do not publish a
@@ -124,8 +126,9 @@ the real task definition, official metric direction, and data split/group/time p
 If the gate is aligned, do not edit it. Return `aligned_accept` only for a successful gate receipt
 and a sound PR; otherwise return `aligned_reject`. If the gate itself is misaligned or has become
 gameable, repair `.pfc/adaptive-eval/**`, run its self-test, commit linearly on the existing gate
-ref, push `HEAD:{gate_ref}`, and return `repair_published`. The runtime will reject the current PR
-and require a new receipt under the replacement gate; never retroactively bless it. Use
+ref, push `HEAD:{gate_ref}`, and return `repair_published`. The runtime will return the current PR
+to its author, who must modify or rebase it and resubmit the same PR under the replacement gate;
+never retroactively bless an old CI receipt. Use
 `insufficient` if alignment cannot honestly be determined, which also prevents merge.
 
 Do not merge, publish main, alter lane branches, or communicate with other lanes. Rejection and

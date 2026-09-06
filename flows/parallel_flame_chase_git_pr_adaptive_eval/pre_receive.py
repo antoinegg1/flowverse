@@ -154,7 +154,7 @@ def protect_main(repository: Path, database: Path, old: str, new: str) -> None:
 
 
 def protect_lane(database: Path, reference: str, new: str) -> None:
-    """Keep a ready/reviewing branch at its frozen registered head."""
+    """Keep a CI/review branch at its frozen registered head."""
     if set(new) == {"0"}:
         reject("run-owned lane branches are retained and cannot be deleted")
     branch = reference.removeprefix("refs/heads/")
@@ -172,10 +172,10 @@ def protect_lane(database: Path, reference: str, new: str) -> None:
         connection.close()
     if (
         row is not None
-        and row["status"] in {"ready", "reviewing"}
+        and row["status"] in {"ci_pending", "ci_running", "ready", "reviewing"}
         and new != row["head_sha"]
     ):
-        reject("a ready/reviewing PR branch is frozen at its registered head")
+        reject("a CI/review PR branch is frozen at its registered head")
 
 
 def protect_eval_gate(repository: Path, old: str, new: str) -> None:
