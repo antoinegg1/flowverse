@@ -19,9 +19,8 @@ DELIVERY_BYTES_PER_SOURCE = 128 * 1024
 class ReportBus:
     """Runtime-owned append logs with per-consumer at-least-once cursors."""
 
-    def __init__(self, paths: RunPaths, lanes: tuple[LaneName, ...] = LANES) -> None:
+    def __init__(self, paths: RunPaths) -> None:
         self.paths = paths
-        self.lanes = lanes
         self._lock = threading.RLock()
 
     def publish(self, lane: LaneName, report: dict[str, object]) -> None:
@@ -42,7 +41,7 @@ class ReportBus:
         acknowledgements: dict[str, int] = {}
         with self._lock:
             consumer_cursors = cast("dict[str, Any]", cursors.setdefault(consumer, {}))
-            for source in self.lanes:
+            for source in LANES:
                 if source == consumer:
                     continue
                 path = self.paths.reports / f"{source}.jsonl"
