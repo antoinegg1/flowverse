@@ -16,7 +16,15 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 SCHEMA_VERSION = 2
-PR_STATES = {"draft", "ready", "reviewing", "merged", "rejected"}
+PR_STATES = {
+    "draft",
+    "ci_pending",
+    "ci_running",
+    "ready",
+    "reviewing",
+    "merged",
+    "rejected",
+}
 FACT_STATES = {"proposed", "verified", "conflicted", "stale", "revoked"}
 EXPERIMENT_OUTCOMES = {
     "active",
@@ -141,6 +149,10 @@ class CoordinationStore:
                     base_sha TEXT NOT NULL,
                     provisional_receipt_id TEXT,
                     ready_at TEXT,
+                    ci_submitted_at TEXT,
+                    ci_attempt INTEGER NOT NULL DEFAULT 0,
+                    last_ci_receipt_id TEXT,
+                    last_ci_failure TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     rejection_reason TEXT,
@@ -245,6 +257,29 @@ class CoordinationStore:
                     ON experiments(family, target, base_ref, outcome);
                 """
             )
+            pr_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(pull_requests)")
+            }
+            for column, statement in (
+                (
+                    "ci_submitted_at",
+                    "ALTER TABLE pull_requests ADD COLUMN ci_submitted_at TEXT",
+                ),
+                (
+                    "ci_attempt",
+                    "ALTER TABLE pull_requests ADD COLUMN ci_attempt INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "last_ci_receipt_id",
+                    "ALTER TABLE pull_requests ADD COLUMN last_ci_receipt_id TEXT",
+                ),
+                (
+                    "last_ci_failure",
+                    "ALTER TABLE pull_requests ADD COLUMN last_ci_failure TEXT",
+                ),
+            ):
+                if column not in pr_columns:
+                    connection.execute(statement)
             expected = {
                 "schema_version": SCHEMA_VERSION,
                 "run_id": run_id,
@@ -529,6 +564,283 @@ class CoordinationStore:
             )
         for event in events:
             append_event(self.events, event)
+
+    def submit_pr_for_ci(
+        self,
+        *,
+        pr_id: str,
+        lane: str,
+        head_sha: str,
+        base_sha: str,
+    ) -> dict[str, object]:
+        """Freeze the latest pushed draft revision and enqueue run-local CI."""
+        stamp = timestamp()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM pull_requests WHERE id=?", (pr_id,)
+            ).fetchone()
+            if row is None or row["lane"] != lane or row["status"] != "draft":
+                raise ValueError("only the owning lane may submit its draft PR to CI")
+            active = connection.execute(
+                """
+                SELECT id FROM pull_requests
+                WHERE lane=? AND status IN ('ci_pending', 'ci_running', 'ready', 'reviewing')
+                    AND id!=?
+                ORDER BY updated_at, id LIMIT 1
+                """,
+                (lane, pr_id),
+            ).fetchone()
+            if active is not None:
+                raise ValueError(f"{lane} already has active PR {active['id']}")
+            connection.execute(
+                """
+                UPDATE pull_requests
+                SET status='ci_pending', head_sha=?, base_sha=?, provisional_receipt_id=NULL,
+                    ready_at=NULL, ci_submitted_at=?, ci_attempt=ci_attempt+1,
+                    last_ci_receipt_id=NULL, last_ci_failure=NULL, rejection_reason=NULL,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (head_sha, base_sha, stamp, stamp, pr_id),
+            )
+            event = self._event(
+                connection,
+                "pr_ci_queued",
+                lane=lane,
+                payload={"pr_id": pr_id, "head_sha": head_sha},
+            )
+            updated = dict(row)
+            updated.update(
+                status="ci_pending",
+                head_sha=head_sha,
+                base_sha=base_sha,
+                provisional_receipt_id=None,
+                ready_at=None,
+                ci_submitted_at=stamp,
+                ci_attempt=int(row["ci_attempt"] or 0) + 1,
+                last_ci_receipt_id=None,
+                last_ci_failure=None,
+                rejection_reason=None,
+                updated_at=stamp,
+            )
+        append_event(self.events, event)
+        return updated
+
+    def claim_next_ci(self) -> dict[str, object] | None:
+        """Claim the oldest queued PR revision for the single CI worker."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM pull_requests WHERE status='ci_pending'
+                ORDER BY ci_submitted_at, id LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            stamp = timestamp()
+            connection.execute(
+                "UPDATE pull_requests SET status='ci_running', updated_at=? WHERE id=?",
+                (stamp, row["id"]),
+            )
+            event = self._event(
+                connection,
+                "pr_ci_started",
+                lane=row["lane"],
+                payload={
+                    "pr_id": row["id"],
+                    "head_sha": row["head_sha"],
+                    "attempt": int(row["ci_attempt"] or 0),
+                },
+            )
+            updated = dict(row)
+            updated.update(status="ci_running", updated_at=stamp)
+        append_event(self.events, event)
+        return updated
+
+    def complete_ci(
+        self,
+        *,
+        pr_id: str,
+        passed: bool,
+        receipt_id: str | None,
+        reason: str,
+    ) -> dict[str, object]:
+        """Promote a passing revision or return a failed one to its lane."""
+        stamp = timestamp()
+        events: list[dict[str, object]] = []
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM pull_requests WHERE id=?", (pr_id,)
+            ).fetchone()
+            if row is None or row["status"] != "ci_running":
+                raise ValueError("only a running CI revision may complete")
+            if receipt_id is not None:
+                receipt = connection.execute(
+                    "SELECT * FROM receipts WHERE id=?", (receipt_id,)
+                ).fetchone()
+                if (
+                    receipt is None
+                    or receipt["lane"] != row["lane"]
+                    or receipt["pr_id"] != pr_id
+                    or receipt["commit_sha"] != row["head_sha"]
+                    or receipt["kind"] != "provisional"
+                ):
+                    raise ValueError(
+                        "CI receipt does not match the submitted PR revision"
+                    )
+                if passed and int(receipt["exit_code"]) != 0:
+                    raise ValueError("passing CI requires a successful receipt")
+            elif passed:
+                raise ValueError("passing CI requires a receipt")
+
+            if passed:
+                superseded = connection.execute(
+                    """
+                    SELECT id FROM pull_requests
+                    WHERE lane=? AND status='ready' AND id!=?
+                    ORDER BY ready_at, id
+                    """,
+                    (row["lane"], pr_id),
+                ).fetchall()
+                for old in superseded:
+                    superseded_reason = f"superseded by passing CI revision {pr_id}"
+                    connection.execute(
+                        """
+                        UPDATE pull_requests
+                        SET status='rejected', rejection_reason=?, updated_at=? WHERE id=?
+                        """,
+                        (superseded_reason, stamp, old["id"]),
+                    )
+                    events.append(
+                        self._event(
+                            connection,
+                            "pr_superseded",
+                            lane=row["lane"],
+                            payload={
+                                "pr_id": old["id"],
+                                "replacement_pr_id": pr_id,
+                            },
+                        )
+                    )
+                connection.execute(
+                    """
+                    UPDATE pull_requests
+                    SET status='ready', provisional_receipt_id=?, ready_at=?,
+                        last_ci_receipt_id=?, last_ci_failure=NULL, updated_at=?
+                    WHERE id=?
+                    """,
+                    (receipt_id, stamp, receipt_id, stamp, pr_id),
+                )
+                kind = "pr_ci_passed"
+                status = "ready"
+            else:
+                connection.execute(
+                    """
+                    UPDATE pull_requests
+                    SET status='draft', provisional_receipt_id=NULL, ready_at=NULL,
+                        last_ci_receipt_id=?, last_ci_failure=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (receipt_id, reason[:4000], stamp, pr_id),
+                )
+                kind = "pr_ci_failed"
+                status = "draft"
+            events.append(
+                self._event(
+                    connection,
+                    kind,
+                    lane=row["lane"],
+                    payload={
+                        "pr_id": pr_id,
+                        "head_sha": row["head_sha"],
+                        "receipt_id": receipt_id,
+                        "reason": reason[:2000],
+                    },
+                )
+            )
+            updated = dict(row)
+            updated.update(
+                status=status,
+                provisional_receipt_id=receipt_id if passed else None,
+                ready_at=stamp if passed else None,
+                last_ci_receipt_id=receipt_id,
+                last_ci_failure=None if passed else reason[:4000],
+                updated_at=stamp,
+            )
+        for event in events:
+            append_event(self.events, event)
+        return updated
+
+    def return_pr_to_lane(self, *, pr_id: str, reason: str) -> dict[str, object]:
+        """Unlock a non-merged PR revision so its author can amend and resubmit."""
+        stamp = timestamp()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pull_requests WHERE id=?", (pr_id,)
+            ).fetchone()
+            if row is None or row["status"] not in {
+                "ci_pending",
+                "ci_running",
+                "ready",
+                "reviewing",
+            }:
+                raise ValueError("only an active PR can be returned to its lane")
+            connection.execute(
+                """
+                UPDATE pull_requests
+                SET status='draft', provisional_receipt_id=NULL, ready_at=NULL,
+                    last_ci_failure=?, rejection_reason=NULL, updated_at=?
+                WHERE id=?
+                """,
+                (reason[:4000], stamp, pr_id),
+            )
+            event = self._event(
+                connection,
+                "pr_returned_to_lane",
+                lane=row["lane"],
+                payload={"pr_id": pr_id, "reason": reason[:2000]},
+            )
+            updated = dict(row)
+            updated.update(
+                status="draft",
+                provisional_receipt_id=None,
+                ready_at=None,
+                last_ci_failure=reason[:4000],
+                rejection_reason=None,
+                updated_at=stamp,
+            )
+        append_event(self.events, event)
+        return updated
+
+    def requeue_running_ci(self) -> int:
+        """Recover CI revisions whose ephemeral worker was lost on resume."""
+        stamp = timestamp()
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, lane FROM pull_requests WHERE status='ci_running'"
+            ).fetchall()
+            connection.execute(
+                """
+                UPDATE pull_requests SET status='ci_pending', updated_at=?
+                WHERE status='ci_running'
+                """,
+                (stamp,),
+            )
+            events = [
+                self._event(
+                    connection,
+                    "pr_ci_requeued",
+                    lane=row["lane"],
+                    payload={"pr_id": row["id"]},
+                )
+                for row in rows
+            ]
+        for event in events:
+            append_event(self.events, event)
+        return len(rows)
 
     def active_review(self) -> dict[str, object] | None:
         """Return the unique active FIFO review, if any."""

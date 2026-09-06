@@ -17,9 +17,16 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 try:  # The runtime copies this file beside the standalone storage module.
-    from pfc_storage import CoordinationStore, canonical_json, content_id, timestamp
+    from pfc_storage import (
+        PR_STATES,
+        CoordinationStore,
+        canonical_json,
+        content_id,
+        timestamp,
+    )
 except ModuleNotFoundError:  # pragma: no cover - used from the source checkout
     from parallel_flame_chase_git_pr_adaptive_eval.storage import (
+        PR_STATES,
         CoordinationStore,
         canonical_json,
         content_id,
@@ -429,30 +436,34 @@ def command_pr_open(context: Context, arguments: argparse.Namespace) -> int:
     return 0
 
 
-def command_pr_ready(context: Context, arguments: argparse.Namespace) -> int:
+def command_pr_submit(context: Context, arguments: argparse.Namespace) -> int:
+    """Freeze the pushed revision and enqueue it for run-local CI."""
     if not context.is_lane:
-        raise ValueError("only a research lane may mark its PR ready")
+        raise ValueError("only a research lane may submit its PR to CI")
     repository = repository_root(context)
     head_sha, _tree = clean_head(repository)
     branch = current_branch(repository)
     pr = context.store.pr(arguments.pr_id)
     if pr["lane"] != context.lane or pr["branch"] != branch:
-        raise ValueError("ready must run on the owning PR branch")
+        raise ValueError("CI submission must run on the owning PR branch")
     if pushed_head(repository, branch) != head_sha:
-        raise ValueError("push the exact current head before marking the PR ready")
+        raise ValueError("push the exact current head before submitting to CI")
     run_git("fetch", "origin", "main", cwd=repository)
     base = run_git("merge-base", "origin/main", head_sha, cwd=repository)
     patterns = list(context.store.meta("allowed_paths"))
     validate_pr_paths(repository, base, head_sha, patterns)
-    verify_receipt_artifacts(context, repository, arguments.receipt, head_sha)
-    context.store.ready_pr(
+    submitted = context.store.submit_pr_for_ci(
         pr_id=arguments.pr_id,
         lane=context.lane,
         head_sha=head_sha,
-        receipt_id=arguments.receipt,
+        base_sha=base,
     )
-    print(canonical_json(context.store.pr(arguments.pr_id)))
+    print(canonical_json(submitted))
     return 0
+
+
+def command_pr_ready(_context: Context, _arguments: argparse.Namespace) -> int:
+    raise ValueError("lane-side ready is disabled; use `pfc pr submit PRxxxxxx`")
 
 
 def command_pr_list(context: Context, arguments: argparse.Namespace) -> int:
@@ -733,10 +744,13 @@ def parser() -> argparse.ArgumentParser:
     pr_ready.add_argument("pr_id")
     pr_ready.add_argument("--receipt", required=True)
     pr_ready.set_defaults(handler=command_pr_ready)
+    pr_submit = pr_commands.add_parser("submit")
+    pr_submit.add_argument("pr_id")
+    pr_submit.set_defaults(handler=command_pr_submit)
     pr_list = pr_commands.add_parser("list")
     pr_list.add_argument(
         "--status",
-        choices=sorted({"draft", "ready", "reviewing", "merged", "rejected"}),
+        choices=sorted(PR_STATES),
     )
     pr_list.set_defaults(handler=command_pr_list)
     pr_show = pr_commands.add_parser("show")

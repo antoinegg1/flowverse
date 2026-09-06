@@ -67,6 +67,36 @@ class CoordinatorWork:
     gate_ref_before: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CIExecution:
+    """Captured result from one isolated run-local CI process."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(slots=True)
+class CIWork:
+    """The single serialized CI job, bound to one frozen PR revision."""
+
+    future: Future[CIExecution] | None = None
+    pr: dict[str, object] | None = None
+    workspace: Path | None = None
+
+
+def _run_ci_command(command: list[str], workspace: Path) -> CIExecution:
+    result = subprocess.run(
+        command,
+        cwd=workspace,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return CIExecution(result.returncode, result.stdout, result.stderr)
+
+
 def _run_structured(
     session: Session,
     prompt: str,
@@ -100,7 +130,7 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
     mode_name = "git-pr-adaptive-eval"
     skill_name = "adaptive-pr-eval-coordinator"
     orchestrator_role_name = "coordinator"
-    executor_workers = 4
+    executor_workers = 5
     planning_cadence = (
         "Dispatch lanes once; gate construction and per-receipt audits use fresh coordinator "
         "sessions while lanes continue independently."
@@ -128,6 +158,7 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
         )
         self.adaptive_paths: AdaptiveEvalPaths
         self.coordinator_work = CoordinatorWork()
+        self.ci_work = CIWork()
 
     def _new_mode_control(self) -> dict[str, object]:
         control = super()._new_mode_control()
@@ -137,6 +168,7 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
             "active_gate": None,
             "audit_queue": [],
             "audits": {},
+            "ci": {"completed": 0, "passed": 0, "failed": 0},
         }
         return control
 
@@ -157,6 +189,14 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
             adaptive.get("audits"), dict
         ):
             raise TypeError("resumable adaptive audit state is malformed")
+        ci = adaptive.setdefault("ci", {"completed": 0, "passed": 0, "failed": 0})
+        if not isinstance(ci, dict) or any(
+            not isinstance(ci.get(field), int)
+            or isinstance(ci.get(field), bool)
+            or int(ci[field]) < 0
+            for field in ("completed", "passed", "failed")
+        ):
+            raise TypeError("resumable adaptive CI state is malformed")
 
     def _source_files(self) -> tuple[Path, Path, Path]:
         directory = Path(__file__).resolve().parent
@@ -212,10 +252,25 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
 
     def _initialize_mode_paths(self) -> None:
         super()._initialize_mode_paths()
+        # The base initializer installs its module-local store class. Reattach this
+        # workflow's compatible extension so CI transitions and migrations are present.
+        self.store = CoordinationStore(self.git_paths.database, self.git_paths.events)
+        self.store.initialize(
+            run_id=cast("str", self.control["run_id"]),
+            git_pr_enabled=True,
+            global_knowledge_enabled=False,
+            experiment_memory_enabled=False,
+            lanes=cast("tuple[str, ...]", self.lane_names),
+            allowed_paths=cast("list[str]", self.store.meta("allowed_paths")),
+            trusted_evaluator_command=cast(
+                "list[str]", self.store.meta("trusted_evaluator_command")
+            ),
+        )
         self.adaptive_paths = AdaptiveEvalPaths(self.paths.root)
         if not self._runner_path().exists():
             raise RuntimeError("resumable adaptive gate runner is missing")
         adaptive = cast("dict[str, Any]", self.control["adaptive_eval"])
+        self.store.requeue_running_ci()
         if adaptive.get("build_status") == "building":
             adaptive["build_status"] = "not-started"
         queue = cast("list[str]", adaptive["audit_queue"])
@@ -226,6 +281,10 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
                     queue.append(receipt_id)
         active = current_gate(self.adaptive_paths)
         adaptive["active_gate"] = active
+        for pr in self.store.prs():
+            receipt_id = pr.get("last_ci_receipt_id")
+            if isinstance(receipt_id, str):
+                self._queue_audit(receipt_id)
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -237,6 +296,7 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
 
     def _validate_mode_layout(self) -> None:
         super()._validate_mode_layout()
+        self.adaptive_paths = AdaptiveEvalPaths(self.paths.root)
         for path in (
             self._runner_path(),
             self.adaptive_paths.registry,
@@ -262,8 +322,9 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
                 if self.adaptive_paths.registry.exists()
                 else None
             ),
-            "publication": "coordinator commit; applies only to later PRs",
-            "merge": "automatic after receipt integrity and coordinator audit",
+            "publication": "coordinator commit; applies to later CI submissions",
+            "ci": "runtime-owned isolated checkout of each frozen submitted revision",
+            "merge": "automatic after CI receipt integrity and coordinator audit",
             "failure_visibility": "author lane plus coordinator only",
         }
         git_pr = cast("dict[str, object]", mapping["git_pr"])
@@ -631,6 +692,7 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
         return True
 
     def _scan_receipts(self) -> bool:
+        """Advance the receipt cursor and recover audits for CI-authoritative receipts."""
         git_state = cast("dict[str, Any]", self.control["git_pr"])
         cursor = int(git_state.get("receipt_cursor", 0))
         receipts, end = self.store.receipts_after(cursor)
@@ -642,32 +704,13 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
             ):
                 continue
             receipt_id = cast("str", receipt["id"])
+            try:
+                pr = self.store.pr(cast("str", receipt["pr_id"]))
+            except (KeyError, TypeError):
+                continue
+            if pr.get("last_ci_receipt_id") != receipt_id:
+                continue
             changed = self._queue_audit(receipt_id) or changed
-            if int(receipt["exit_code"]) != 0:
-                try:
-                    normalized = self._gate_receipt(receipt)
-                    reason = normalized.reason
-                except (KeyError, OSError, ValueError) as why:
-                    reason = f"Evaluator receipt was invalid: {why}"
-                self._emit_system(
-                    targets=(cast("LaneName", receipt["lane"]),),
-                    kind="private_failed_evaluation",
-                    summary=reason[:2000],
-                    payload={
-                        "receipt_id": receipt_id,
-                        "pr_id": receipt.get("pr_id"),
-                        "exit_code": receipt["exit_code"],
-                    },
-                )
-                self._append_coordinator_inbox(
-                    {
-                        "receipt_id": receipt_id,
-                        "pr_id": receipt.get("pr_id"),
-                        "lane": receipt["lane"],
-                        "status": "failed-evaluation-awaiting-audit",
-                        "reason": reason[:2000],
-                    }
-                )
         git_state["receipt_cursor"] = end
         return changed or end != cursor
 
@@ -686,10 +729,241 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
         registry = json.loads(self.adaptive_paths.registry.read_text(encoding="utf-8"))
         history = cast("list[dict[str, object]]", registry["history"])
         first_activation = cast("str", history[0]["activated_at"])
-        if cast("str", pr["created_at"]) >= first_activation:
+        submitted_at = cast("str", pr.get("ci_submitted_at") or pr["created_at"])
+        if submitted_at >= first_activation:
             raise ValueError(
-                "this PR was opened after gate activation and needs a gated receipt"
+                "this CI attempt was submitted after gate activation and needs a gated receipt"
             )
+
+    def _ci_workspace(self, pr: dict[str, object]) -> Path:
+        root = self.git_paths.shared / "ci-workspaces"
+        root.mkdir(parents=True, exist_ok=True)
+        workspace = root / f"{pr['id']}-attempt-{pr['ci_attempt']}"
+        if workspace.is_symlink():
+            raise RuntimeError(f"refusing linked CI workspace: {workspace}")
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                str(self.git_paths.central),
+                str(workspace),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--quiet", "--detach", cast("str", pr["head_sha"])],
+            cwd=workspace,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return workspace
+
+    @staticmethod
+    def _ci_receipt_id(output: str) -> str | None:
+        for line in reversed(output.splitlines()):
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and isinstance(value.get("receipt_id"), str):
+                return cast("str", value["receipt_id"])
+        return None
+
+    def _private_ci_failure(
+        self, pr: dict[str, object], reason: str, *, receipt_id: str | None
+    ) -> None:
+        payload = {
+            "pr_id": pr["id"],
+            "head_sha": pr["head_sha"],
+            "ci_attempt": pr["ci_attempt"],
+            "receipt_id": receipt_id,
+            "status": "draft",
+        }
+        self._emit_system(
+            targets=(cast("LaneName", pr["lane"]),),
+            kind="private_ci_failed",
+            summary=(
+                f"CI returned {pr['id']} to draft: {reason[:1800]} "
+                "Modify the same branch, push it, and resubmit the same PR."
+            ),
+            payload=payload,
+        )
+        self._append_coordinator_inbox(
+            {
+                **payload,
+                "lane": pr["lane"],
+                "status": "ci-failed-awaiting-audit" if receipt_id else "ci-failed",
+                "reason": reason[:2000],
+            }
+        )
+
+    def _start_ci(self) -> bool:
+        if self.ci_work.future is not None:
+            return False
+        pr = self.store.claim_next_ci()
+        if pr is None:
+            return False
+        try:
+            workspace = self._ci_workspace(pr)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as why:
+            reason = f"CI workspace setup failed: {type(why).__name__}: {why}"
+            self.store.complete_ci(
+                pr_id=cast("str", pr["id"]),
+                passed=False,
+                receipt_id=None,
+                reason=reason,
+            )
+            ci = cast(
+                "dict[str, int]",
+                cast("dict[str, Any]", self.control["adaptive_eval"])["ci"],
+            )
+            ci["completed"] += 1
+            ci["failed"] += 1
+            self._private_ci_failure(pr, reason, receipt_id=None)
+            return True
+        command = [
+            str(self.git_paths.bin / "pfc"),
+            "--run-root",
+            str(self.paths.root),
+            "--lane",
+            cast("str", pr["lane"]),
+            "evaluate",
+            "--pr",
+            cast("str", pr["id"]),
+            "--",
+            *cast("list[str]", self.store.meta("trusted_evaluator_command")),
+        ]
+        self.ci_work = CIWork(
+            future=self.executor.submit(_run_ci_command, command, workspace),
+            pr=pr,
+            workspace=workspace,
+        )
+        self.store.record_telemetry(
+            "adaptive_ci_worker_started",
+            {
+                "pr_id": pr["id"],
+                "head_sha": pr["head_sha"],
+                "attempt": pr["ci_attempt"],
+            },
+            lane=cast("str", pr["lane"]),
+        )
+        return True
+
+    def _collect_ci(self) -> bool:
+        work = self.ci_work
+        if work.future is None or not work.future.done():
+            return False
+        pr = cast("dict[str, object]", work.pr)
+        execution: CIExecution | None = None
+        worker_error: str | None = None
+        try:
+            execution = work.future.result()
+        except Exception as why:  # noqa: BLE001 - return infrastructure failures to lane
+            worker_error = f"{type(why).__name__}: {why}"[:2000]
+        self.ci_work = CIWork()
+
+        receipt_id = self._ci_receipt_id(execution.stdout) if execution else None
+        normalized: GateReceipt | None = None
+        reason = worker_error or "CI did not produce a receipt."
+        passed = False
+        if receipt_id is not None:
+            try:
+                receipt = self.store.receipt(receipt_id)
+                normalized = self._gate_receipt(
+                    receipt, require_head=cast("str", pr["head_sha"])
+                )
+                observed_main = cast(
+                    "str",
+                    cast("dict[str, Any]", self.control["git_pr"])["observed_main_sha"],
+                )
+                if execution is None or execution.returncode != 0:
+                    raise ValueError(normalized.reason)
+                if normalized.decision != "accept":
+                    raise ValueError(normalized.reason)
+                if normalized.incumbent_sha != observed_main:
+                    raise ValueError("main changed during CI; rebase and resubmit")
+                if pr["base_sha"] != observed_main:
+                    raise ValueError(
+                        "PR is not based on current main; rebase and resubmit"
+                    )
+                self._receipt_gate_is_eligible(pr, normalized)
+            except (KeyError, OSError, ValueError) as why:
+                reason = str(why)
+            else:
+                passed = True
+                reason = normalized.reason
+        elif execution is not None:
+            reason = (
+                f"CI command exited {execution.returncode} without a receipt. "
+                f"{execution.stderr[-1200:]}"
+            ).strip()
+
+        try:
+            self.store.complete_ci(
+                pr_id=cast("str", pr["id"]),
+                passed=passed,
+                receipt_id=receipt_id,
+                reason=reason,
+            )
+        except ValueError as why:
+            passed = False
+            reason = f"CI receipt binding failed: {why}"
+            receipt_id = None
+            self.store.complete_ci(
+                pr_id=cast("str", pr["id"]),
+                passed=False,
+                receipt_id=None,
+                reason=reason,
+            )
+
+        ci = cast(
+            "dict[str, int]",
+            cast("dict[str, Any]", self.control["adaptive_eval"])["ci"],
+        )
+        ci["completed"] += 1
+        ci["passed" if passed else "failed"] += 1
+        if receipt_id is not None:
+            self._queue_audit(receipt_id)
+        self.store.record_telemetry(
+            "adaptive_ci_worker_completed",
+            {
+                "pr_id": pr["id"],
+                "head_sha": pr["head_sha"],
+                "attempt": pr["ci_attempt"],
+                "passed": passed,
+                "receipt_id": receipt_id,
+                "reason": reason[:2000],
+            },
+            lane=cast("str", pr["lane"]),
+        )
+        if not passed:
+            self._private_ci_failure(pr, reason, receipt_id=receipt_id)
+        if work.workspace is not None:
+            shutil.rmtree(work.workspace, ignore_errors=True)
+        return True
+
+    def _reject_fast_path(self, pr: dict[str, object], reason: str) -> None:
+        returned = self.store.return_pr_to_lane(
+            pr_id=cast("str", pr["id"]), reason=reason
+        )
+        self._emit_system(
+            targets=(cast("LaneName", returned["lane"]),),
+            kind="private_pr_returned_by_gate",
+            summary=(
+                f"{reason} The PR is draft again: modify the same branch, push, "
+                "and resubmit the same PR to CI."
+            ),
+            payload={"pr_id": returned["id"], "status": "draft"},
+        )
 
     def _process_fast_path(self) -> bool:
         """FIFO automatic merge after exact receipt and coordinator audit acceptance."""
@@ -802,18 +1076,22 @@ class AdaptiveEvalGitPRRuntime(BaseGitPRRuntime):
 
     def _control_cycle(self) -> None:
         changed = self._collect_coordinator_work()
+        changed = self._collect_ci() or changed
         changed = self._scan_receipts() or changed
         changed = self._observe_main() or changed
         changed = self._process_fast_path() or changed
         changed = self._observe_main() or changed
         changed = self._start_gate_build() or changed
         changed = self._start_audit() or changed
+        changed = self._start_ci() or changed
         if changed:
             self._persist()
 
     def _close_sessions(self) -> None:
         super()._close_sessions()
         close_safely(self.coordinator_work.session)
+        if self.ci_work.future is not None:
+            self.ci_work.future.cancel()
 
 
 def execute(

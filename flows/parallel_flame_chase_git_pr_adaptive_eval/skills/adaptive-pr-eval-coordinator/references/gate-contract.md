@@ -29,9 +29,10 @@ diff is limited to `.pfc/adaptive-eval/**`. Each update must change `manifest.js
 Paths in the manifest are relative and may not escape the bundle. The official and proxy metric
 directions must match. The validity command runs in the candidate checkout before the proxy.
 
-## Entrypoint invocation
+## CI invocation
 
-The runtime invokes:
+For every `pfc pr submit`, the runtime freezes the exact pushed head, checks it out from the
+run-local central Git repository into an isolated CI workspace, and invokes:
 
 ```text
 python evaluate.py \
@@ -60,4 +61,5 @@ and at least one task-specific leakage/robustness failure. Keep fixtures synthet
 
 When the current gate is aligned, do not commit a cosmetic rewrite. Repair only for concrete
 misalignment, structural failure, or a demonstrated gaming route. A repair invalidates the current
-submission: publish the new linear gate commit and require a new PR with a fresh candidate receipt.
+CI attempt: publish the new linear gate commit, return the same PR to `draft`, and require a fresh
+submission and receipt after the author has modified or rebased it.
