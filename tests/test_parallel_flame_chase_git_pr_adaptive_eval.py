@@ -198,30 +198,18 @@ def test_manifest_rejects_proxy_direction_mismatch() -> None:
         GateManifest.model_validate(value)
 
 
-def test_gate_applies_only_to_ci_attempts_submitted_after_activation(
-    tmp_path: Path,
-) -> None:
+def test_gate_applies_only_to_prs_opened_after_activation(tmp_path: Path) -> None:
     database = tmp_path / "coordination.sqlite"
     connection = sqlite3.connect(database)
     try:
+        connection.execute("CREATE TABLE pull_requests(id TEXT, created_at TEXT)")
         connection.execute(
-            "CREATE TABLE pull_requests(id TEXT, created_at TEXT, ci_submitted_at TEXT)"
+            "INSERT INTO pull_requests VALUES(?, ?)",
+            ("PR000001", "2026-01-01T00:00:00Z"),
         )
         connection.execute(
-            "INSERT INTO pull_requests VALUES(?, ?, ?)",
-            (
-                "PR000001",
-                "2025-12-31T23:00:00Z",
-                "2026-01-01T00:00:00Z",
-            ),
-        )
-        connection.execute(
-            "INSERT INTO pull_requests VALUES(?, ?, ?)",
-            (
-                "PR000002",
-                "2025-12-31T23:00:00Z",
-                "2026-01-01T00:02:00Z",
-            ),
+            "INSERT INTO pull_requests VALUES(?, ?)",
+            ("PR000002", "2026-01-01T00:02:00Z"),
         )
         connection.commit()
     finally:
@@ -387,7 +375,7 @@ def test_lanes_can_start_while_coordinator_builds_gate(
             chosen.lane_3_actor_a,
         ):
             assert lane_agent.prompts  # type: ignore[attr-defined]
-            assert "run-local CI check" in lane_agent.prompts[0][1]  # type: ignore[attr-defined]
+            assert "open the draft before evaluating" in lane_agent.prompts[0][1]  # type: ignore[attr-defined]
     finally:
         runtime._close_sessions()
         runtime.executor.shutdown(wait=True, cancel_futures=True)
@@ -440,25 +428,26 @@ def test_audited_receipt_is_merged_automatically(
             runtime.git_paths.lane("lane-2"), cli, "pr", "list"
         )
         assert json.loads(lane_two_listing.stdout) == []
-        lane_side_ready = subprocess.run(
-            [cli, "pr", "ready", pr_id, "--receipt", "R-not-ci"],
-            cwd=lane,
-            check=False,
-            capture_output=True,
-            text=True,
+        evaluated = run_command(
+            lane,
+            cli,
+            "evaluate",
+            "--pr",
+            pr_id,
+            "--",
+            sys.executable,
+            str(runtime._runner_path()),
         )
-        assert lane_side_ready.returncode == 2
-        assert "lane-side ready is disabled" in lane_side_ready.stderr
-        submitted = run_command(lane, cli, "pr", "submit", pr_id)
-        assert json.loads(submitted.stdout)["status"] == "ci_pending"
-        assert runtime._start_ci() is True
-        assert runtime.ci_work.future is not None
-        runtime.ci_work.future.result(timeout=10)
-        assert runtime._collect_ci() is True
-        passed_pr = runtime.store.pr(pr_id)
-        assert passed_pr["status"] == "ready"
-        receipt_id = passed_pr["provisional_receipt_id"]
-        assert isinstance(receipt_id, str)
+        receipt_id = json.loads(evaluated.stdout.splitlines()[-1])["receipt_id"]
+        run_command(
+            lane,
+            cli,
+            "pr",
+            "ready",
+            pr_id,
+            "--receipt",
+            receipt_id,
+        )
         assert runtime._scan_receipts() is True
         adaptive = runtime.control["adaptive_eval"]
         adaptive["audit_queue"].clear()
@@ -471,91 +460,6 @@ def test_audited_receipt_is_merged_automatically(
         assert runtime._observe_main() is True
         assert runtime.store.pr(pr_id)["status"] == "merged"
         assert (source / "candidate.py").read_text(encoding="utf-8") == "VALUE = 1\n"
-    finally:
-        runtime._close_sessions()
-        runtime.executor.shutdown(wait=True, cancel_futures=True)
-
-
-def test_failed_ci_returns_same_pr_to_lane_for_push_and_resubmit(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "TASK.md").write_text(
-        "You MUST only modify `candidate.py`.\nYou MUST run `python evaluator.py`.\n",
-        encoding="utf-8",
-    )
-    (source / "candidate.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (source / "evaluator.py").write_text(
-        "from candidate import VALUE\n"
-        "print(f'CYCLES: {VALUE}')\n"
-        "raise SystemExit(0 if VALUE < 2 else 3)\n",
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(source)
-    monkeypatch.setattr(runtime_state, "home", lambda: tmp_path / "humanize-home")
-    runtime = AdaptiveEvalGitPRRuntime(
-        fake_agents(),
-        "Improve candidate.py. You MUST run `python evaluator.py`.",
-        Config(rest_seconds=0.05),
-        {},
-    )
-    try:
-        runtime.prepare()
-        lane = runtime.git_paths.lane("lane-1")
-        run_git(lane, "switch", "-c", "lane-1/ci-retry")
-        (lane / "candidate.py").write_text("VALUE = 3\n", encoding="utf-8")
-        run_git(lane, "add", "candidate.py")
-        run_git(lane, "commit", "-m", "candidate that fails CI")
-        run_git(lane, "push", "-u", "origin", "HEAD")
-        cli = str(runtime.git_paths.bin / "pfc")
-        opened = run_command(
-            lane,
-            cli,
-            "pr",
-            "open",
-            "--draft",
-            "--title",
-            "Exercise CI retry",
-            "--hypothesis",
-            "The first revision should fail and the corrected one should pass",
-        )
-        pr_id = json.loads(opened.stdout)["id"]
-        run_command(lane, cli, "pr", "submit", pr_id)
-
-        (lane / "candidate.py").write_text("VALUE = 1\n", encoding="utf-8")
-        run_git(lane, "add", "candidate.py")
-        run_git(lane, "commit", "-m", "correct candidate after CI feedback")
-        frozen_push = subprocess.run(
-            ["git", "push", "origin", "HEAD"],
-            cwd=lane,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        assert frozen_push.returncode != 0
-        assert "frozen" in frozen_push.stderr
-
-        assert runtime._start_ci() is True
-        assert runtime.ci_work.future is not None
-        runtime.ci_work.future.result(timeout=10)
-        assert runtime._collect_ci() is True
-        failed_pr = runtime.store.pr(pr_id)
-        assert failed_pr["status"] == "draft"
-        assert failed_pr["ci_attempt"] == 1
-        assert failed_pr["last_ci_failure"]
-
-        run_git(lane, "push", "origin", "HEAD")
-        resubmitted = run_command(lane, cli, "pr", "submit", pr_id)
-        assert json.loads(resubmitted.stdout)["ci_attempt"] == 2
-        assert runtime._start_ci() is True
-        assert runtime.ci_work.future is not None
-        runtime.ci_work.future.result(timeout=10)
-        assert runtime._collect_ci() is True
-        passed_pr = runtime.store.pr(pr_id)
-        assert passed_pr["status"] == "ready"
-        assert passed_pr["ci_attempt"] == 2
-        assert passed_pr["last_ci_failure"] is None
     finally:
         runtime._close_sessions()
         runtime.executor.shutdown(wait=True, cancel_futures=True)
