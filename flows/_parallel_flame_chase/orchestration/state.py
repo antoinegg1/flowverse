@@ -57,7 +57,10 @@ class RuntimeState:
         "This is the only coordinator turn; lanes will subsequently self-coordinate "
         "through durable reports."
     )
+    orchestrator_role_name = "coordinator"
     replan_on_objective_revision = True
+    executor_workers = 4
+    lane_names: tuple[LaneName, ...] = LANES
 
     def __init__(
         self,
@@ -83,7 +86,7 @@ class RuntimeState:
         self.bus: ReportBus
         self.lanes: dict[LaneName, LaneRuntime] = {}
         self.executor = ThreadPoolExecutor(
-            max_workers=4,
+            max_workers=self.executor_workers,
             thread_name_prefix="parallel-flame",
         )
         self.completed_turns = 0
@@ -116,7 +119,7 @@ class RuntimeState:
         """Validate runtime paths owned by a specialized mode."""
 
     def _validate_layout(self) -> None:
-        validate_runtime_layout(self.paths)
+        validate_runtime_layout(self.paths, self.lane_names)
         self._validate_mode_layout()
 
     def _resolve_objective(self) -> tuple[str, bool, bool]:
@@ -170,11 +173,11 @@ class RuntimeState:
         run_id = self.control.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             raise ValueError("resumable state has no run_id")
-        InitialPlan.model_validate(self.control.get("plan"))
+        self._validate_plan(self.control.get("plan"))
         lanes = self.control.get("lanes")
-        if not isinstance(lanes, dict) or set(lanes) != set(LANES):
-            raise ValueError("resumable state must contain exactly three lanes")
-        for lane in LANES:
+        if not isinstance(lanes, dict) or set(lanes) != set(self.lane_names):
+            raise ValueError("resumable state has the wrong lane topology")
+        for lane in self.lane_names:
             held = lanes[lane]
             if not isinstance(held, dict):
                 raise TypeError(f"{lane} resumable state is malformed")
@@ -224,7 +227,7 @@ class RuntimeState:
                     "blocked": False,
                     "last_error": None,
                 }
-                for lane in LANES
+                for lane in self.lane_names
             },
             "bus_cursors": {},
             "latest_reports": {},
@@ -255,9 +258,11 @@ class RuntimeState:
                 },
             },
             "artifact_roots": {
-                lane: str(self.paths.artifact_root(lane)) for lane in LANES
+                lane: str(self.paths.artifact_root(lane)) for lane in self.lane_names
             },
-            "checkpoints": {lane: str(self.paths.checkpoint(lane)) for lane in LANES},
+            "checkpoints": {
+                lane: str(self.paths.checkpoint(lane)) for lane in self.lane_names
+            },
             "candidate_submissions": {
                 "all_lanes_may_submit": True,
                 "local_evaluator_only": True,
@@ -274,6 +279,7 @@ class RuntimeState:
             objective=objective,
             workspace_map=self._workspace_map(),
             skill=self.skill_name,
+            role_name=self.orchestrator_role_name,
             cadence=self.planning_cadence,
         )
         failures: list[str] = []
@@ -299,6 +305,10 @@ class RuntimeState:
         raise RuntimeError(
             f"initial coordinator failed after 3 fresh sessions: {failures}"
         )
+
+    def _validate_plan(self, value: object) -> Any:
+        """Validate the mode's durable planning document."""
+        return InitialPlan.model_validate(value)
 
     def _resume_run(self, objective: str) -> None:
         """Load one complete compatible run without recreating missing durable state."""
@@ -329,23 +339,26 @@ class RuntimeState:
             self.paths.root,
             self.paths.shared,
             self.paths.reports,
-            self.paths.private / "lane-2",
-            self.paths.private / "lane-3",
-            *(self.paths.reports / f"{lane}.jsonl" for lane in LANES),
+            *(
+                self.paths.private / lane
+                for lane in self.lane_names
+                if lane != "lane-1"
+            ),
+            *(self.paths.reports / f"{lane}.jsonl" for lane in self.lane_names),
         )
         if not all(path.exists() for path in required):
             raise RuntimeError(
                 "resumable run is incomplete; refusing to recreate lost state"
             )
         self._validate_layout()
-        initialize_paths(self.paths, make_snapshots=False)
+        initialize_paths(self.paths, make_snapshots=False, lanes=self.lane_names)
 
     def _create_run(self, objective: str) -> None:
         """Create durable directories and private snapshots for a fresh run."""
         self.control = self._new_control(objective)
         self.paths = RunPaths(Path(cast("str", self.control["run_root"])), self.source)
         self.paths.root.mkdir(parents=True, exist_ok=False)
-        initialize_paths(self.paths, make_snapshots=True)
+        initialize_paths(self.paths, make_snapshots=True, lanes=self.lane_names)
 
     def _open_run(self, objective: str, resume: bool) -> None:
         if resume:
@@ -353,7 +366,7 @@ class RuntimeState:
         else:
             self._create_run(objective)
         self._initialize_mode_paths()
-        self.bus = ReportBus(self.paths)
+        self.bus = ReportBus(self.paths, self.lane_names)
         atomic_text(self.paths.root / "objective.md", objective + "\n")
         atomic_json(self.paths.workspace_map, self._workspace_map())
         self._validate_layout()
@@ -388,7 +401,7 @@ class RuntimeState:
                 "task_fingerprint": task_fingerprint(objective),
             }
         )
-        for lane in LANES:
+        for lane in self.lane_names:
             lane_state = self.control["lanes"][lane]
             lane_state["blocked"] = False
             lane_state["consecutive_failures"] = 0

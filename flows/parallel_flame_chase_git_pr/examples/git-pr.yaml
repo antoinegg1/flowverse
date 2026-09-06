@@ -1,0 +1,7 @@
+rest_seconds: 1.0
+resume_mode: auto
+git_pr_enabled: true
+global_knowledge_enabled: false
+experiment_memory_enabled: false
+token_efficient_enabled: false
+main_update_monitor_enabled: false
