@@ -1,4 +1,4 @@
-"""Shared public types for the two independently registered flows."""
+"""Shared public types for independently registered parallel flows."""
 
 from __future__ import annotations
 
@@ -22,8 +22,42 @@ class Agents(NamedTuple):
     lane_3_actor_b: NoGoals
 
 
+class OrchestrateorAgents(NamedTuple):
+    """Additive-variant topology with the planning role named orchestrateor."""
+
+    orchestrateor: NoGoals
+    lane_1_actor_a: NoGoals
+    lane_1_actor_b: NoGoals
+    lane_2_actor_a: NoGoals
+    lane_2_actor_b: NoGoals
+    lane_3_actor_a: NoGoals
+    lane_3_actor_b: NoGoals
+
+    @property
+    def coordinator(self) -> NoGoals:
+        """Keep the shared runtime compatible without exposing the old role name."""
+        return self.orchestrateor
+
+
+class GitPRAgents(NamedTuple):
+    """Git/PR topology with one planner and two alternating actors per lane."""
+
+    orchestrateor: NoGoals
+    lane_1_actor_a: NoGoals
+    lane_1_actor_b: NoGoals
+    lane_2_actor_a: NoGoals
+    lane_2_actor_b: NoGoals
+    lane_3_actor_a: NoGoals
+    lane_3_actor_b: NoGoals
+
+    @property
+    def coordinator(self) -> NoGoals:
+        """Adapt the historical spelling to the shared scheduler interface."""
+        return self.orchestrateor
+
+
 class BaseConfig(BaseModel):
-    """Pacing and resume policy shared by both schedulers."""
+    """Pacing and resume policy shared by the parallel schedulers."""
 
     model_config = {"extra": "forbid"}
 
